@@ -1,0 +1,26 @@
+services:
+  zorail:
+    # Run the prebuilt image from GHCR...
+    image: ghcr.io/nees/zorail:latest
+    # ...or build locally instead by uncommenting:
+    # build: .
+    restart: unless-stopped
+    ports:
+      # Host 25 -> container 25 (inbound SMTP). Use "2525:25" if 25 is taken.
+      - "25:25"
+      # Host 8080 -> container 8080 (web UI + JSON API).
+      - "8080:8080"
+    environment:
+      ZORAIL_DOMAIN: "mail.yourorg.test"
+      # Restrict the catch-all to domains you control. Comma-separated.
+      ZORAIL_ALLOWED_DOMAINS: "mail.yourorg.test"
+      ZORAIL_MAX_MESSAGE_BYTES: "26214400" # 25 MiB
+      ZORAIL_LOG_LEVEL: "info"
+      ZORAIL_DB_PATH: "/data/zorail.db"
+      # Set a token to require auth on the API/UI (recommended off localhost):
+      # ZORAIL_API_TOKEN: "change-me"
+    volumes:
+      - zorail-data:/data
+
+volumes:
+  zorail-data:

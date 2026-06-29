@@ -1,0 +1,21 @@
+# Binaries
+/zorail
+/bin/
+*.exe
+
+# Local databases
+*.db
+*.db-wal
+*.db-shm
+
+# TLS material
+*.crt
+*.key
+*.pem
+
+# Env / local config
+.env
+.env.local
+
+# OS / editor
+.DS_Store
