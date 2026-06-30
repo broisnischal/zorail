@@ -235,19 +235,24 @@ func (m Model) renderMessage(w int) string {
 		b.WriteString("\n" + th.colTitle.Render("LINKS") + "\n")
 		seen := map[string]bool{}
 		for _, l := range msg.Extracted.Links {
-			h := hostOf(l)
-			if seen[h] {
-				continue
+			l = urlAmp.Replace(l) // repair &amp; in links cached before the extractor fix
+			if seen[l] {
+				continue // dedupe by full URL, not host, so distinct links survive
 			}
-			seen[h] = true
-			b.WriteString(th.link.Render(h) + "  ")
+			seen[l] = true
+			// Clickable OSC 8 hyperlink to the full URL; visible label is a
+			// readable, truncated form on its own line so each link is separately
+			// clickable.
+			label := th.link.Render(shortLink(l, max(24, min(w, 72))))
+			b.WriteString(osc8(l, label) + "\n")
 		}
-		b.WriteString("\n")
 	}
 
 	body := msg.Text
 	if strings.TrimSpace(body) == "" && msg.HTML != "" {
-		body = htmlToText(msg.HTML)
+		body = htmlToText(msg.HTML) // anchors become clickable OSC 8 links
+	} else if strings.TrimSpace(body) != "" {
+		body = linkifyText(body) // make bare URLs in plain-text bodies clickable
 	}
 	if strings.TrimSpace(body) == "" {
 		body = "(no text body)"

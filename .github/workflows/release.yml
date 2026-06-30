@@ -1,0 +1,105 @@
+name: Release CLI
+
+# Builds the zorail CLI (server + tooling, one binary) for every platform and
+# attaches the archives to a GitHub Release.
+#
+#   • Push a tag `vX.Y.Z`  → cross-compiles all targets and publishes a Release.
+#   • Manual run (Actions → Release CLI → Run workflow) → builds the same
+#     artifacts and uploads them to the run for download, without releasing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for a manual build (e.g. v0.3.0-test)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: write # needed to create the Release on tag pushes
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.28.0"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build web UI and embed it
+        run: |
+          cd ui
+          pnpm install --frozen-lockfile
+          pnpm generate
+          cd ..
+          rm -rf internal/api/web
+          mkdir -p internal/api/web
+          cp -r ui/.output/public/. internal/api/web/
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cross-compile binaries
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist build
+          num="${VERSION#v}" # strip leading v for the embedded version string
+          ldflags="-s -w -X github.com/nees/zorail/internal/api.Version=${num}"
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${t%/*}"; arch="${t#*/}"
+            bin="zorail"; [ "$os" = "windows" ] && bin="zorail.exe"
+            echo "→ $os/$arch"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags="$ldflags" -o "build/$bin" ./cmd/zorail
+            name="zorail_${VERSION}_${os}_${arch}"
+            if [ "$os" = "windows" ]; then
+              (cd build && zip -q "../dist/${name}.zip" "$bin")
+            else
+              (cd build && tar -czf "../dist/${name}.tar.gz" "$bin")
+            fi
+            rm -f "build/$bin"
+          done
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -la dist
+
+      # On a tag: publish a GitHub Release with all archives + checksums.
+      - name: Publish Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      # On a manual run: keep the artifacts on the workflow run for download.
+      - name: Upload artifacts (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zorail-binaries
+          path: dist/*

@@ -5,10 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 // Up runs the two local processes that make inbound mail flow — the Zorail
@@ -37,44 +41,91 @@ func Up(ctx context.Context, o Options) error {
 	}
 
 	fmt.Println(bold("\n  zorail up — starting Zorail server + Cloudflare Tunnel"))
-	fmt.Printf("  config %s · Ctrl+C stops both\n", o.EnvFile)
+	fmt.Printf("  config %s · Ctrl+C stops everything it started\n", o.EnvFile)
 
-	// A child context so that when one process exits we can cancel the other;
+	// A child context so that when one process exits we can cancel the rest;
 	// exec.CommandContext kills the process when its context is cancelled.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	srv := serverCmd(runCtx, repoRoot)
-	srv.Stdout, srv.Stderr = prefixWriter("server", os.Stdout), prefixWriter("server", os.Stderr)
+	type proc struct {
+		name string
+		cmd  *exec.Cmd
+	}
+	var procs []proc
+
+	// If a Zorail server already answers on the configured HTTP address, reuse
+	// it (starting a second would fail with "address already in use"); only run
+	// the tunnel. Otherwise start our own server too.
+	httpAddr := firstNonEmpty(readEnvValue(o.EnvFile, "ZORAIL_HTTP_ADDR"), ":8090")
+	if serverResponding("http://" + localProbeHost(httpAddr) + "/api/config") {
+		okf("server already running on %s — starting tunnel only", httpAddr)
+	} else {
+		srv := serverCmd(runCtx, repoRoot)
+		srv.Stdout, srv.Stderr = prefixWriter("server", os.Stdout), prefixWriter("server", os.Stderr)
+		if err := srv.Start(); err != nil {
+			return fmt.Errorf("start server: %w", err)
+		}
+		procs = append(procs, proc{"server", srv})
+	}
 
 	tun := exec.CommandContext(runCtx, cfdPath, "tunnel", "run", "--token", tunTok)
 	tun.Stdout, tun.Stderr = prefixWriter("tunnel", os.Stdout), prefixWriter("tunnel", os.Stderr)
-
-	if err := srv.Start(); err != nil {
-		return fmt.Errorf("start server: %w", err)
-	}
 	if err := tun.Start(); err != nil {
 		cancel()
-		_ = srv.Wait()
+		for _, p := range procs {
+			_ = p.cmd.Wait()
+		}
 		return fmt.Errorf("start cloudflared: %w", err)
 	}
-	okf("server pid %d · tunnel pid %d", srv.Process.Pid, tun.Process.Pid)
+	procs = append(procs, proc{"tunnel", tun})
 
-	errCh := make(chan error, 2)
+	labels := make([]string, len(procs))
+	for i, p := range procs {
+		labels[i] = fmt.Sprintf("%s pid %d", p.name, p.cmd.Process.Pid)
+	}
+	okf("%s", strings.Join(labels, " · "))
+
+	errCh := make(chan error, len(procs))
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); errCh <- tagErr("server", srv.Wait()) }()
-	go func() { defer wg.Done(); errCh <- tagErr("tunnel", tun.Wait()) }()
+	for _, p := range procs {
+		wg.Add(1)
+		go func() { defer wg.Done(); errCh <- tagErr(p.name, p.cmd.Wait()) }()
+	}
 
 	select {
 	case <-runCtx.Done(): // Ctrl+C
 		fmt.Fprintln(os.Stderr, "\n  "+yellow("!")+" stopping…")
 	case err := <-errCh: // one process died on its own
-		fmt.Fprintln(os.Stderr, "\n  "+yellow("!")+" "+err.Error()+" — stopping the other")
+		fmt.Fprintln(os.Stderr, "\n  "+yellow("!")+" "+err.Error()+" — stopping the rest")
 	}
 	cancel()
 	wg.Wait()
 	return nil
+}
+
+// localProbeHost turns a bind address (":8090", "0.0.0.0:8090") into a loopback
+// host:port suitable for probing the local server.
+func localProbeHost(addr string) string {
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "127.0.0.1:8090"
+	}
+	if h == "" || h == "0.0.0.0" || h == "::" {
+		h = "127.0.0.1"
+	}
+	return net.JoinHostPort(h, p)
+}
+
+// serverResponding reports whether a Zorail server already answers /api/config.
+func serverResponding(url string) bool {
+	c := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := c.Get(url)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 // serverCmd builds the command that runs the Zorail server, preferring a built

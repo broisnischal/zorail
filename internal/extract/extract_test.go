@@ -22,6 +22,22 @@ func TestCodesAndLinks(t *testing.T) {
 	}
 }
 
+func TestLinkAmpEntitiesDecoded(t *testing.T) {
+	// HTML hrefs encode query separators as &amp;; the extracted link must use
+	// real & so provider sign-in links (mode=…&oobCode=…) resolve correctly.
+	html := `<a href="https://proj.firebaseapp.com/__/auth/action?apiKey=K&amp;mode=signIn&amp;oobCode=XYZ&amp;lang=en">Sign in</a>`
+	r := From(nil, "", html)
+	want := "https://proj.firebaseapp.com/__/auth/action?apiKey=K&mode=signIn&oobCode=XYZ&lang=en"
+	if !contains(r.Links, want) {
+		t.Errorf("link not decoded.\n got: %v\nwant: %s", r.Links, want)
+	}
+	for _, l := range r.Links {
+		if strings.Contains(l, "&amp;") {
+			t.Errorf("link still contains &amp;: %s", l)
+		}
+	}
+}
+
 func TestCodeDetectionAccuracy(t *testing.T) {
 	cases := []struct {
 		name, text, want string

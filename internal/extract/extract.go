@@ -193,8 +193,17 @@ func unsubscribe(headers map[string]string, text, html string) []string {
 	return set.slice(10)
 }
 
+// ampEntities un-encodes the ampersand a URL is HTML-attribute-encoded with
+// inside an href (`&` → `&amp;`). Without this, query separators stay encoded
+// and a link like `?mode=signIn&amp;oobCode=…` opens with a param named
+// `amp;oobCode` and no real `oobCode`/`mode` — breaking provider sign-in links.
+// Only the ampersand forms are decoded, never a blanket HTML unescape, so a
+// legitimate param such as `&copy=1` is left intact.
+var ampEntities = strings.NewReplacer("&amp;", "&", "&#38;", "&", "&#x26;", "&", "&#X26;", "&")
+
 func trimURL(u string) string {
-	return strings.TrimRight(strings.TrimSpace(u), ".,;)]\"'")
+	u = ampEntities.Replace(strings.TrimSpace(u))
+	return strings.TrimRight(u, ".,;)]\"'")
 }
 
 // orderedSet preserves first-seen order while de-duplicating.
