@@ -44,10 +44,13 @@ fi
 
 prompt() { # prompt VAR "question" "default"
   local __var="$1" __q="$2" __def="$3" __ans=""
-  if [ -n "$NONINTERACTIVE" ] || [ ! -t 0 ]; then
+  # When run as `curl … | bash`, stdin is the script, not the keyboard — so read
+  # from the controlling terminal (/dev/tty) instead. Only skip prompting when
+  # asked (NONINTERACTIVE) or when there is genuinely no terminal (cron, CI).
+  if [ -n "$NONINTERACTIVE" ] || [ ! -e /dev/tty ]; then
     printf -v "$__var" '%s' "${!__var:-$__def}"; return
   fi
-  read -r -p "$(printf '%s %s %s' "$__q" "${DIM}[$__def]${RESET}" '› ')" __ans || true
+  read -r -p "$(printf '%s %s %s' "$__q" "${DIM}[$__def]${RESET}" '› ')" __ans </dev/tty || true
   printf -v "$__var" '%s' "${__ans:-${!__var:-$__def}}"
 }
 

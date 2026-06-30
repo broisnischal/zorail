@@ -157,6 +157,24 @@
 ::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 * { scrollbar-color: var(--border) transparent; scrollbar-width: thin; }
 
+/* ---- Vue <Transition> presets ----------------------------------------------
+   `page`  : section ↔ section (out-in) — a soft fade + tiny lift.
+   `fade`  : inbox list ↔ detail (out-in).
+   `overlay`: sign-in / modal surfaces. */
+.page-enter-active { transition: opacity 0.2s ease, transform 0.2s ease; }
+.page-leave-active { transition: opacity 0.12s ease; }
+.page-enter-from   { opacity: 0; transform: translateY(6px); }
+.page-leave-to     { opacity: 0; }
+
+.fade-enter-active { transition: opacity 0.18s ease, transform 0.18s ease; }
+.fade-leave-active { transition: opacity 0.1s ease; }
+.fade-enter-from   { opacity: 0; transform: translateY(4px); }
+.fade-leave-to     { opacity: 0; }
+
+.overlay-enter-active { transition: opacity 0.2s ease; }
+.overlay-leave-active { transition: opacity 0.15s ease; }
+.overlay-enter-from, .overlay-leave-to { opacity: 0; }
+
 @media (prefers-reduced-motion: reduce) {
   *, ::before, ::after {
     animation-duration: 0.01ms !important;

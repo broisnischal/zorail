@@ -89,7 +89,9 @@ onBeforeUnmount(() => { z.stopPolling(); window.removeEventListener('keydown', o
 
       <!-- section content -->
       <div class="min-h-0 flex-1 overflow-hidden">
-        <component :is="sectionComponent" />
+        <Transition name="page" mode="out-in">
+          <component :is="sectionComponent" :key="state.section" />
+        </Transition>
       </div>
     </main>
 
@@ -101,13 +103,15 @@ onBeforeUnmount(() => { z.stopPolling(); window.removeEventListener('keydown', o
   </div>
 
   <!-- optional sign-in (others can browse without it; needed only to manage) -->
-  <div v-if="state.signinOpen" class="fixed inset-0 z-50 bg-background">
-    <button
-      class="absolute right-5 top-5 inline-flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-      title="Close" @click="z.closeSignIn()"
-    ><X class="size-4" /></button>
-    <SignIn />
-  </div>
+  <Transition name="overlay">
+    <div v-if="state.signinOpen" class="fixed inset-0 z-50 bg-background">
+      <button
+        class="absolute right-5 top-5 inline-flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        title="Close" @click="z.closeSignIn()"
+      ><X class="size-4" /></button>
+      <SignIn />
+    </div>
+  </Transition>
 
   <Toaster position="bottom-right" :duration="2600" />
 </template>

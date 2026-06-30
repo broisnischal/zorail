@@ -118,13 +118,35 @@ async function copy(v: string, note = 'copied') {
 async function loadConfig() {
   try { state.config = await call<ServerConfig>('/config') } catch { /* keep defaults */ }
 }
+// sameIds reports whether two lists hold the same items in the same order.
+// IDs are immutable, so this lets polling skip a reassignment (and the re-render
+// flicker that comes with it) when nothing actually changed.
+function sameIds<T extends { id: string }>(a: T[], b: T[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i]!.id !== b[i]!.id) return false
+  return true
+}
+function sameInboxes(a: InboxSummary[], b: InboxSummary[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]!.inbox !== b[i]!.inbox || a[i]!.message_count !== b[i]!.message_count) return false
+  }
+  return true
+}
+
 async function loadInboxes() {
-  await guard(async () => { state.inboxes = (await call<InboxSummary[]>('/inboxes')) || [] })
+  await guard(async () => {
+    const next = (await call<InboxSummary[]>('/inboxes')) || []
+    if (!sameInboxes(state.inboxes, next)) state.inboxes = next
+  })
 }
 async function loadMessages() {
   if (!state.inbox) return
-  state.loadingInbox = true
-  await guard(async () => { state.messages = (await call<MsgMeta[]>(`/inboxes/${enc(state.inbox)}/messages`)) || [] })
+  if (!state.messages.length) state.loadingInbox = true // skeleton only on first load, never on poll
+  await guard(async () => {
+    const next = (await call<MsgMeta[]>(`/inboxes/${enc(state.inbox)}/messages`)) || []
+    if (!sameIds(state.messages, next)) state.messages = next
+  })
   state.loadingInbox = false
 }
 async function openInbox(inbox: string) {

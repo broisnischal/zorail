@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Inbox, Plus, Search, ArrowLeft, Hourglass, Loader2, Copy, Trash2, Pin, MailOpen, ArrowRight } from 'lucide-vue-next'
+import { Inbox, Plus, Search, ArrowLeft, Hourglass, Loader2, Copy, Trash2, Pin, MailOpen, ArrowRight, AtSign } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -8,6 +8,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 const z = useZorail()
 const { state } = z
 
+const domain = computed(() => state.config.domain || 'localhost')
 const sortedInboxes = computed(() =>
   [...state.inboxes].sort((a, b) => Number(z.isPinned(b.inbox)) - Number(z.isPinned(a.inbox))),
 )
@@ -32,55 +33,58 @@ function openTyped() {
 </script>
 
 <template>
-  <!-- ============ LIST MODE ============ -->
-  <AppPage v-if="!state.inbox" title="Inboxes" subtitle="Every address at your domain is a live, disposable inbox.">
-    <template #actions>
-      <Button size="sm" @click="newAddress"><Plus /> New address</Button>
-    </template>
-
-    <!-- open any inbox by typing it -->
-    <div class="mb-5 flex items-center gap-2">
-      <div class="relative flex-1">
-        <Search class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-        <Input
-          v-model="typed" class="h-10 pl-9"
-          :placeholder="`Open any inbox — type an address (e.g. qa-1 or qa-1@${state.config.domain || 'localhost'})`"
-          @keydown.enter="openTyped"
-        />
+  <Transition name="fade" mode="out-in">
+  <!-- ============ LIST / LANDING MODE (public, YOPmail-style) ============ -->
+  <div v-if="!state.inbox" key="list" class="h-full overflow-y-auto">
+    <div class="mx-auto flex min-h-full w-full max-w-[640px] flex-col items-center px-6 py-16">
+      <div class="mb-6 flex size-14 items-center justify-center rounded-2xl border bg-muted/50">
+        <Inbox class="size-6" />
       </div>
-      <Button variant="outline" class="h-10" :disabled="!typed.trim()" @click="openTyped">Open <ArrowRight /></Button>
-    </div>
+      <h1 class="text-center text-[28px] font-semibold tracking-tight">Open any inbox</h1>
+      <p class="mt-2 max-w-[440px] text-center text-[13.5px] leading-relaxed text-muted-foreground">
+        Public, disposable inboxes — type any address and read its mail instantly.
+        No sign-up, nothing to create. Mail sent to it just appears.
+      </p>
 
-    <div v-if="state.inboxes.length" class="overflow-hidden rounded-xl border">
-      <button
-        v-for="ib in sortedInboxes" :key="ib.inbox"
-        class="flex w-full items-center gap-3 border-b border-border-subtle px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/50"
-        @click="z.openInbox(ib.inbox)"
-      >
-        <span class="flex size-8 shrink-0 items-center justify-center rounded-lg border bg-muted/50">
-          <Inbox class="size-4 text-muted-foreground" />
-        </span>
-        <span class="min-w-0 flex-1">
-          <span class="block truncate font-mono text-[13px]">{{ ib.inbox }}</span>
-          <span class="block text-[11.5px] text-muted-foreground">{{ ib.message_count }} message{{ ib.message_count === 1 ? '' : 's' }}</span>
-        </span>
-        <Pin
-          v-if="z.isPinned(ib.inbox)" class="size-3.5 text-muted-foreground" fill="currentColor"
-        />
-        <span class="shrink-0 text-[11.5px] tabular-nums text-muted-foreground">{{ relTime(ib.last_received) }}</span>
+      <div class="mt-7 flex w-full max-w-[500px] items-center gap-2">
+        <div class="relative flex-1">
+          <AtSign class="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            v-model="typed" autofocus class="h-11 pl-10 text-[14px]"
+            :placeholder="`anything   ·   or   anything@${domain}`"
+            @keydown.enter="openTyped"
+          />
+        </div>
+        <Button class="h-11" :disabled="!typed.trim()" @click="openTyped">Open <ArrowRight /></Button>
+      </div>
+      <button class="mt-3 text-[12.5px] text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline" @click="newAddress">
+        or generate a random address
       </button>
-    </div>
 
-    <EmptyState
-      v-else :icon="Inbox" title="No inboxes yet"
-      description="Generate a disposable address, then point your test mail at it — messages show up here instantly."
-    >
-      <Button size="sm" @click="newAddress"><Plus /> New address</Button>
-    </EmptyState>
-  </AppPage>
+      <!-- recently active inboxes -->
+      <div v-if="state.inboxes.length" class="mt-12 w-full">
+        <div class="mb-2 px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Recently active</div>
+        <div class="overflow-hidden rounded-xl border">
+          <button
+            v-for="ib in sortedInboxes" :key="ib.inbox"
+            class="flex w-full items-center gap-3 border-b border-border-subtle px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/50"
+            @click="z.openInbox(ib.inbox)"
+          >
+            <span class="flex size-8 shrink-0 items-center justify-center rounded-lg border bg-muted/50"><Inbox class="size-4 text-muted-foreground" /></span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate font-mono text-[13px]">{{ ib.inbox }}</span>
+              <span class="block text-[11.5px] text-muted-foreground">{{ ib.message_count }} message{{ ib.message_count === 1 ? '' : 's' }}</span>
+            </span>
+            <Pin v-if="z.isPinned(ib.inbox)" class="size-3.5 text-muted-foreground" fill="currentColor" />
+            <span class="shrink-0 text-[11.5px] tabular-nums text-muted-foreground">{{ relTime(ib.last_received) }}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- ============ DETAIL MODE ============ -->
-  <div v-else class="flex h-full min-h-0 flex-col">
+  <div v-else key="detail" class="flex h-full min-h-0 flex-col">
     <!-- inbox header -->
     <header class="flex h-14 flex-none items-center gap-2 border-b px-4">
       <Button variant="ghost" size="icon-sm" title="Back to inboxes" @click="z.closeInbox()"><ArrowLeft /></Button>
@@ -149,4 +153,5 @@ function openTyped() {
       </section>
     </div>
   </div>
+  </Transition>
 </template>
