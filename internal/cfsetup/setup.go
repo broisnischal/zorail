@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,54 +41,52 @@ func slug(s string) string {
 func Run(ctx context.Context, o Options) error {
 	in := bufio.NewReader(os.Stdin)
 
-	fmt.Println(bold("\n  zmail setup — connect a real domain to your localhost Zorail\n"))
+	fmt.Println(bold("\n  zorail setup — connect a real domain to your localhost Zorail\n"))
 	fmt.Println("  This points your domain's mail at this machine via Cloudflare Email")
 	fmt.Print("  Routing → an Email Worker → a Cloudflare Tunnel → /api/ingest.\n\n")
 
-	// ---- gather inputs ----
+	// ---- defaults ----
+	if o.ServerURL == "" {
+		o.ServerURL = "http://127.0.0.1:8090"
+	}
+	if o.EnvFile == "" {
+		o.EnvFile = RepoEnvFile()
+	}
+	origin := localOrigin(o.ServerURL)
+
+	// ---- Cloudflare token (resolved first: we need it to list zones) ----
+	o.CFToken = resolveCFToken(in, o)
+	if o.CFToken == "" {
+		return fmt.Errorf("a Cloudflare API token is required")
+	}
+	cf := NewCF(o.CFToken)
+	step("Verifying Cloudflare token")
+	if err := cf.VerifyToken(ctx); err != nil {
+		return err
+	}
+
+	// ---- mail domain (picked from the account's zones when not given) ----
 	if o.Domain == "" {
-		o.Domain = prompt(in, "Mail domain (e.g. example.com)", "")
+		picked, err := pickDomain(ctx, in, cf)
+		if err != nil {
+			return err
+		}
+		o.Domain = picked
 	}
 	o.Domain = strings.ToLower(strings.TrimSpace(o.Domain))
 	if o.Domain == "" {
 		return fmt.Errorf("a domain is required")
 	}
-	if o.ServerURL == "" {
-		o.ServerURL = prompt(in, "Local Zorail server URL", "http://127.0.0.1:8090")
-	}
 	if o.Hostname == "" {
 		o.Hostname = "ingest." + o.Domain
 	}
-	if o.EnvFile == "" {
-		o.EnvFile = ".env"
-	}
-	if o.CFToken == "" {
-		o.CFToken = os.Getenv("CLOUDFLARE_API_TOKEN")
-	}
-	if o.CFToken == "" {
-		o.CFToken = promptSecret("Cloudflare API token (Zone:Email Routing, Workers, DNS, Tunnel edit)")
-	}
-	if o.CFToken == "" {
-		return fmt.Errorf("a Cloudflare API token is required")
-	}
 
-	origin := localOrigin(o.ServerURL)
-
-	cf := NewCF(o.CFToken)
-
-	// ---- 1. verify token + resolve zone ----
-	step("Verifying Cloudflare token")
-	if err := cf.VerifyToken(ctx); err != nil {
-		return err
-	}
 	zone, err := cf.Zone(ctx, o.Domain)
 	if err != nil {
 		return err
 	}
 	// If the mail domain is a subdomain of the zone, route just that subdomain.
-	subdomain := ""
 	if !strings.EqualFold(o.Domain, zone.Name) {
-		subdomain = strings.TrimSuffix(o.Domain, "."+zone.Name)
 		okf("zone %s · routing subdomain %s (account %s)", zone.Name, o.Domain, firstNonEmpty(zone.Account.Name, zone.Account.ID))
 	} else {
 		okf("zone %s (account %s)", zone.Name, firstNonEmpty(zone.Account.Name, zone.Account.ID))
@@ -101,7 +101,7 @@ func Run(ctx context.Context, o Options) error {
 	}
 	okf("reachable · domain %s · version %s", firstNonEmpty(cfg.Domain, "?"), firstNonEmpty(cfg.Version, "?"))
 
-	ingestToken, restartNeeded, err := ensureServerToken(ctx, o, cfg.AuthRequired)
+	ingestToken, _, err := ensureServerToken(ctx, o, cfg.AuthRequired)
 	if err != nil {
 		return err
 	}
@@ -138,35 +138,52 @@ func Run(ctx context.Context, o Options) error {
 	okf("worker deployed · posts to %s", ingestURL)
 
 	step("Enabling Email Routing on %s", o.Domain)
-	er, err := cf.GetEmailRouting(ctx, zone.ID)
-	if err != nil {
-		return err
+	// Cloudflare's Email Routing *settings* endpoints (GET /email/routing and
+	// GET /email/routing/dns) reject scoped API tokens with error 10000 no
+	// matter which permissions the token holds — a known API-side quirk. So the
+	// status read and enable are best-effort: a failure here must not abort a
+	// run that has already provisioned the tunnel, worker, and ingress.
+	enabled := false
+	if er, err := cf.GetEmailRouting(ctx, zone.ID); err == nil {
+		enabled = er.Enabled
 	}
-	if !er.Enabled {
+	if !enabled {
 		if err := cf.EnableEmailRouting(ctx, zone.ID); err != nil {
-			return err
+			warnf("couldn't enable Email Routing via API: %v", err)
+			warnf("enable it once in the dashboard (zone %s → Email → Email Routing), then mail will flow", zone.Name)
 		}
 	}
-	recs, err := cf.EmailRoutingDNS(ctx, zone.ID, subdomain)
-	if err != nil {
-		return err
-	}
+	// Write the required MX + SPF records ourselves rather than fetching them
+	// from the token-rejecting GET /email/routing/dns. They are the same for
+	// every zone, and UpsertDNS (DNS:Edit, which works) is idempotent.
+	recs := StandardEmailRoutingDNS(o.Domain)
 	for _, r := range recs {
 		if err := cf.UpsertDNS(ctx, zone.ID, r); err != nil {
 			return fmt.Errorf("add routing record %s %s: %w", r.Type, r.Name, err)
 		}
 	}
-	if subdomain != "" {
-		okf("MX + SPF records for %s in place (%d)", o.Domain, len(recs))
-	} else {
-		okf("MX + SPF records in place (%d)", len(recs))
-	}
+	okf("MX + SPF records for %s in place (%d)", o.Domain, len(recs))
 
 	step("Setting catch-all: *@%s → %s", o.Domain, worker)
 	if err := cf.SetCatchAllToWorker(ctx, zone.ID, worker); err != nil {
 		return err
 	}
 	okf("catch-all active")
+
+	// ---- persist a complete .env so the server and `zorail up` just work ----
+	httpAddr := ":" + portOf(o.ServerURL, "8090")
+	if err := writeServerEnv(o.EnvFile, [][2]string{
+		{"CLOUDFLARE_API_TOKEN", o.CFToken},
+		{"ZORAIL_API_TOKEN", ingestToken},
+		{"ZORAIL_DOMAIN", o.Domain},
+		{"ZORAIL_ALLOWED_DOMAINS", o.Domain},
+		{"ZORAIL_HTTP_ADDR", httpAddr},
+		{"ZORAIL_SMTP_ADDR", ":1025"},
+		{"ZORAIL_TUNNEL_TOKEN", tunnel.Token},
+	}); err != nil {
+		return fmt.Errorf("write %s: %w", o.EnvFile, err)
+	}
+	okf("wrote server config to %s", o.EnvFile)
 
 	// ---- 4. persist state ----
 	st := &State{
@@ -178,7 +195,7 @@ func Run(ctx context.Context, o Options) error {
 	}
 
 	// ---- 5. the tunnel daemon (must run on this machine) ----
-	printTunnelInstructions(tunnel.Token, restartNeeded, o.EnvFile)
+	printTunnelInstructions(o.EnvFile)
 	return nil
 }
 
@@ -220,31 +237,22 @@ func ensureServerToken(ctx context.Context, o Options, authRequired bool) (token
 	return token, true, nil
 }
 
-func printTunnelInstructions(tunnelToken string, restartNeeded bool, envFile string) {
-	fmt.Println(bold("\n  ✓ Cloudflare is configured. Two things run on THIS machine:\n"))
+func printTunnelInstructions(envFile string) {
+	fmt.Println(bold("\n  ✓ Cloudflare is configured. Start everything on THIS machine with one command:\n"))
+	fmt.Println(cmd("       zorail up"))
+	fmt.Printf("\n  That loads %s, starts the Zorail server and the Cloudflare Tunnel\n", envFile)
+	fmt.Print("  together (installing cloudflared if needed), and streams their logs.\n")
 
-	n := 1
-	if restartNeeded {
-		fmt.Printf("  %d. Restart the Zorail server so it picks up the new token in %s:\n", n, envFile)
-		fmt.Print("       (stop the current process, then `make run` or your usual start command)\n\n")
-		n++
-	}
+	fmt.Println(bold("\n  Then, in another terminal, verify end-to-end:"))
+	fmt.Println(cmd("       zorail doctor"))
+	fmt.Println("\n  Once it's up and DNS has propagated (a few minutes), send a message to")
+	fmt.Print("  anything@your-domain and watch it land in `zorail watch`.\n\n")
 
 	have := exec.Command("cloudflared", "--version").Run() == nil
-	fmt.Printf("  %d. Run the Cloudflare Tunnel so the Worker can reach localhost.\n", n)
 	if !have {
-		fmt.Println("     cloudflared isn't installed — get it: https://pkg.cloudflare.com/")
-		fmt.Print("     (Arch: `sudo pacman -S cloudflared`)\n\n")
+		fmt.Println(dim("  (cloudflared isn't installed yet — `zorail up` will guide you, or get it"))
+		fmt.Print(dim("   from https://pkg.cloudflare.com/ · macOS: `brew install cloudflared`)\n\n"))
 	}
-	fmt.Println("     Install it as an always-on service (survives reboots):")
-	fmt.Println(cmd("       sudo cloudflared service install " + tunnelToken))
-	fmt.Println("\n     …or run it in the foreground to test right now:")
-	fmt.Println(cmd("       cloudflared tunnel run --token " + tunnelToken))
-
-	fmt.Println(bold("\n  Then verify end-to-end:"))
-	fmt.Println(cmd("       zmail doctor"))
-	fmt.Println("\n  Once the tunnel is up and DNS has propagated (a few minutes), send a")
-	fmt.Print("  message to anything@your-domain and watch it land in `zmail`.\n\n")
 }
 
 // localOrigin derives the http://localhost:PORT the tunnel points at from the
@@ -263,6 +271,121 @@ func localOrigin(serverURL string) string {
 		}
 	}
 	return "http://localhost:" + port
+}
+
+// resolveCFToken finds the Cloudflare token from (in order) the --cf-token
+// flag, $CLOUDFLARE_API_TOKEN, the dotenv file, or a guided browser-assisted
+// prompt. Setup persists it back to .env, so it is asked at most once.
+func resolveCFToken(in *bufio.Reader, o Options) string {
+	if strings.TrimSpace(o.CFToken) != "" {
+		return strings.TrimSpace(o.CFToken)
+	}
+	if v := strings.TrimSpace(os.Getenv("CLOUDFLARE_API_TOKEN")); v != "" {
+		return v
+	}
+	if v := readEnvValue(o.EnvFile, "CLOUDFLARE_API_TOKEN"); v != "" {
+		okf("using Cloudflare token from %s", o.EnvFile)
+		return v
+	}
+	return guidedToken()
+}
+
+// guidedToken walks a first-time user through creating a scoped API token. It
+// opens a Cloudflare token page with all required permissions *pre-selected*
+// (via a template URL), so the user only reviews and clicks Create. The
+// checklist is printed too, as a safety net in case a permission key changes.
+func guidedToken() string {
+	tokenURL := cfTokenTemplateURL()
+	fmt.Println("\n  A Cloudflare API token is needed once (it'll be saved for next time).")
+	fmt.Println("  Opening a " + bold("pre-filled") + " token page — just review and click " + bold("Create Token") + ", then copy it.")
+	fmt.Println("  " + cmd(tokenURL))
+	fmt.Println("\n  Confirm these permissions are selected (the link pre-fills them):")
+	fmt.Println("    • Account → Cloudflare Tunnel : Edit")
+	fmt.Println("    • Account → Workers Scripts : Edit")
+	fmt.Println("    • Account → Email Routing Addresses : Read")
+	fmt.Println("    • Zone    → DNS : Edit")
+	fmt.Println("    • Zone    → Email Routing Rules : Edit")
+	fmt.Println("    • Zone    → Zone : Read")
+	fmt.Println("  Zone Resources: All zones (or your specific zone).")
+	openBrowser(tokenURL)
+	return promptSecret("Paste the API token")
+}
+
+// cfTokenTemplateURL builds a Cloudflare dashboard link that opens the
+// create-token page with exactly the permissions Zorail needs pre-selected and
+// the token name filled in. See:
+// https://developers.cloudflare.com/fundamentals/api/how-to/account-owned-token-template/
+func cfTokenTemplateURL() string {
+	const perms = `[` +
+		`{"key":"argo_tunnel","type":"edit"},` + // Account · Cloudflare Tunnel
+		`{"key":"workers_scripts","type":"edit"},` + // Account · Workers Scripts
+		`{"key":"email_routing_addresses","type":"read"},` + // Account · Email Routing Addresses
+		`{"key":"dns","type":"edit"},` + // Zone · DNS
+		`{"key":"email_routing_rules","type":"edit"},` + // Zone · Email Routing Rules
+		`{"key":"zone","type":"read"}` + // Zone · Zone
+		`]`
+	q := url.Values{}
+	q.Set("to", "/:account/api-tokens")
+	q.Set("permissionGroupKeys", perms)
+	q.Set("accountId", "*")
+	q.Set("zoneId", "all")
+	q.Set("name", "Zorail mail setup")
+	return "https://dash.cloudflare.com/?" + q.Encode()
+}
+
+// pickDomain lists the account's zones and lets the user choose by number, or
+// type a domain (e.g. a subdomain of a zone) directly.
+func pickDomain(ctx context.Context, in *bufio.Reader, cf *CF) (string, error) {
+	step("Fetching your Cloudflare domains")
+	zones, err := cf.ListZones(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(zones) == 0 {
+		return prompt(in, "Mail domain (e.g. example.com)", ""), nil
+	}
+	for i, z := range zones {
+		fmt.Printf("      %d. %s\n", i+1, z.Name)
+	}
+	for {
+		choice := prompt(in, fmt.Sprintf("Pick a domain [1-%d], or type one (e.g. mail.%s)", len(zones), zones[0].Name), "1")
+		if n, err := strconv.Atoi(choice); err == nil {
+			if n >= 1 && n <= len(zones) {
+				return zones[n-1].Name, nil
+			}
+			fmt.Println("      out of range — try again")
+			continue
+		}
+		if strings.Contains(choice, ".") {
+			return choice, nil
+		}
+		fmt.Println("      not a number or a domain — try again")
+	}
+}
+
+// openBrowser best-effort opens url in the default browser; failure is silent
+// (the URL is always printed too).
+func openBrowser(url string) {
+	var bin string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		bin = "open"
+	case "windows":
+		bin, args = "cmd", []string{"/c", "start"}
+	default:
+		bin = "xdg-open"
+	}
+	_ = exec.Command(bin, append(args, url)...).Start()
+}
+
+// portOf returns the port in serverURL, or def when absent/unparseable.
+func portOf(serverURL, def string) string {
+	u, err := url.Parse(serverURL)
+	if err != nil || u.Port() == "" {
+		return def
+	}
+	return u.Port()
 }
 
 // ---- tiny console helpers ----

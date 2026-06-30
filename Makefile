@@ -1,7 +1,6 @@
-.PHONY: build run dev docker-dev docker-dev-down ui ui-install test tidy clean docker send-test cli watch
+.PHONY: build run up dev docker-dev docker-dev-down ui ui-install test tidy clean docker send-test watch setup doctor
 
 BIN     := bin/zorail
-CLI_BIN := bin/zmail
 UI_DIR  := ui
 WEB_OUT := internal/api/web
 
@@ -17,28 +16,30 @@ ui:
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/zorail
 
-# Run the Go server: SMTP on :1025, web UI + API on :8090, catch-all domain.
-# (8090 rather than the container default 8080 to dodge local port clashes.)
+# Run the Go server: SMTP on :1025, web UI + API on :8090. The server auto-loads
+# .env, so ZORAIL_DOMAIN / ZORAIL_API_TOKEN written by `zorail setup` take effect
+# here (ports stay pinned to :1025/:8090; 8090 dodges the container default 8080).
 run:
-	ZORAIL_SMTP_ADDR=:1025 ZORAIL_HTTP_ADDR=:8090 ZORAIL_DOMAIN=localhost go run ./cmd/zorail
+	ZORAIL_SMTP_ADDR=:1025 ZORAIL_HTTP_ADDR=:8090 go run ./cmd/zorail
 
-# Build the interactive terminal client (zmail).
-cli:
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(CLI_BIN) ./cmd/zmail
+# After `make setup`: start the server AND the Cloudflare Tunnel together, with
+# combined logs. One command, Ctrl+C stops both. This is the normal way to run.
+up:
+	go run ./cmd/zorail up
 
 # Launch the live terminal inbox viewer against a running server (make run).
 # Override the target with URL=… TOKEN=…  e.g.  make watch URL=https://mail.example.com
 watch:
-	go run ./cmd/zmail $(if $(URL),--url $(URL),) $(if $(TOKEN),--token $(TOKEN),)
+	go run ./cmd/zorail watch $(if $(URL),--url $(URL),) $(if $(TOKEN),--token $(TOKEN),)
 
 # Connect a real domain's inbound mail to this server (Cloudflare automation).
 #   make setup DOMAIN=example.com      (prompts for the Cloudflare API token)
 setup:
-	go run ./cmd/zmail setup $(if $(DOMAIN),--domain $(DOMAIN),)
+	go run ./cmd/zorail setup $(if $(DOMAIN),--domain $(DOMAIN),)
 
 # Verify the inbound mail pipeline end-to-end.
 doctor:
-	go run ./cmd/zmail doctor
+	go run ./cmd/zorail doctor
 
 # Frontend hot-reload dev server (proxies /api -> :8090). Run `make run` in a
 # second terminal so the API is live, then open http://localhost:3000.

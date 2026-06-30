@@ -24,7 +24,7 @@ const (
 	waitTimeout  = 25 // seconds; server caps at 120
 )
 
-// Model is the Bubble Tea state for the zmail TUI.
+// Model is the Bubble Tea state for the inbox-viewer TUI.
 type Model struct {
 	c  *Client
 	th theme

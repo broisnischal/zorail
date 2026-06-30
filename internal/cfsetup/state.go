@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// State records what `zmail setup` provisioned, so `zmail doctor` and repeat
+// State records what `zorail setup` provisioned, so `zorail doctor` and repeat
 // runs can find and verify the same resources.
 type State struct {
 	Domain    string `json:"domain"`

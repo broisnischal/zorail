@@ -64,7 +64,7 @@ func (m Model) View() string {
 		return ""
 	}
 	if !m.ready {
-		return "\n  starting zmail…"
+		return "\n  starting…"
 	}
 
 	d := m.dims()
@@ -101,7 +101,7 @@ func (m Model) box(_ lipgloss.Style, focused bool, outerW, innerH int, content s
 
 func (m Model) renderHeader() string {
 	th := m.th
-	brand := th.brand.Render("zorail") + " " + th.faint.Render("zmail")
+	brand := th.brand.Render("zorail") + " " + th.faint.Render("inbox")
 
 	dotColor := th.subtle
 	label := "connecting…"

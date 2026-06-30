@@ -13,7 +13,7 @@ import (
 //
 //   - the OS clipboard via atotto/clipboard (pbcopy / xclip / wl-copy), and
 //   - an OSC52 terminal escape, which reaches the *local* clipboard even when
-//     zmail runs on a remote host through SSH.
+//     the viewer runs on a remote host through SSH.
 //
 // OSC52 is an invisible control sequence, so writing it to stdout under the
 // alt-screen does not disturb the rendered UI. It returns true if either path

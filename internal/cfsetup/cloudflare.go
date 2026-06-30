@@ -1,7 +1,7 @@
 // Package cfsetup automates wiring a real domain's inbound mail into a
 // localhost Zorail server: a Cloudflare Email Routing catch-all → an Email
 // Worker → an HTTPS POST to /api/ingest, reached through a Cloudflare Tunnel.
-// It is driven by `zmail setup` and verified by `zmail doctor`.
+// It is driven by `zorail setup` and verified by `zorail doctor`.
 package cfsetup
 
 import (
@@ -129,6 +129,13 @@ type Zone struct {
 	} `json:"account"`
 }
 
+// ListZones returns every zone the token can see, for interactive selection.
+func (c *CF) ListZones(ctx context.Context) ([]Zone, error) {
+	var zones []Zone
+	err := c.call(ctx, http.MethodGet, "/zones?per_page=50&order=name", nil, &zones)
+	return zones, err
+}
+
 // Zone resolves a domain to its Cloudflare zone, walking up parent labels so a
 // subdomain (mm.lexicon.website) resolves to its registered zone (lexicon.website).
 func (c *CF) Zone(ctx context.Context, domain string) (*Zone, error) {
@@ -206,6 +213,24 @@ func (c *CF) GetEmailRouting(ctx context.Context, zoneID string) (*EmailRouting,
 
 func (c *CF) EnableEmailRouting(ctx context.Context, zoneID string) error {
 	return c.call(ctx, http.MethodPost, "/zones/"+zoneID+"/email/routing/enable", map[string]any{}, nil)
+}
+
+// StandardEmailRoutingDNS returns the MX + SPF records every Cloudflare Email
+// Routing zone uses. They are identical for every zone, so setup writes them
+// directly: the live GET /email/routing/dns endpoint rejects scoped API tokens
+// with error 10000 regardless of the token's permissions. The record name is
+// the full mail domain, which is correct for both an apex and a subdomain.
+func StandardEmailRoutingDNS(domain string) []DNSRecord {
+	mx := func(host string, prio int) DNSRecord {
+		p := prio
+		return DNSRecord{Type: "MX", Name: domain, Content: host, Priority: &p, TTL: 1}
+	}
+	return []DNSRecord{
+		mx("route1.mx.cloudflare.net", 11),
+		mx("route2.mx.cloudflare.net", 28),
+		mx("route3.mx.cloudflare.net", 74),
+		{Type: "TXT", Name: domain, Content: "v=spf1 include:_spf.mx.cloudflare.net ~all", TTL: 1},
+	}
 }
 
 // EmailRoutingDNS returns the MX/TXT records Cloudflare requires for routing.
@@ -313,7 +338,9 @@ func (c *CF) DeployEmailWorker(ctx context.Context, accountID, name, script stri
 }
 
 func (c *CF) WorkerExists(ctx context.Context, accountID, name string) bool {
-	err := c.call(ctx, http.MethodGet, "/accounts/"+accountID+"/workers/scripts/"+name, nil, nil)
+	// Use the /settings subpath: it returns a JSON envelope, whereas the bare
+	// script endpoint returns the multipart module body, which fails to parse.
+	err := c.call(ctx, http.MethodGet, "/accounts/"+accountID+"/workers/scripts/"+name+"/settings", nil, nil)
 	return err == nil
 }
 
@@ -335,6 +362,15 @@ func (c *CF) FindTunnel(ctx context.Context, accountID, name string) (*Tunnel, e
 		return nil, nil
 	}
 	return &tunnels[0], nil
+}
+
+// TunnelRunToken returns the run token for an existing tunnel — the credential
+// `cloudflared tunnel run --token` needs. Used by `zorail up` to start the
+// tunnel without re-provisioning.
+func (c *CF) TunnelRunToken(ctx context.Context, accountID, tunnelID string) (string, error) {
+	var tok string
+	err := c.call(ctx, http.MethodGet, "/accounts/"+accountID+"/cfd_tunnel/"+tunnelID+"/token", nil, &tok)
+	return tok, err
 }
 
 // EnsureTunnel finds or creates a remotely-managed (config_src: cloudflare)

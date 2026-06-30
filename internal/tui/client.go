@@ -1,4 +1,4 @@
-// Package tui implements zmail, the interactive terminal client for a running
+// Package tui implements the interactive terminal inbox viewer for a running
 // Zorail server. It talks to the same JSON API the web dashboard uses, so it
 // works against a local or remote server and reuses the long-poll /wait
 // endpoint for instant, push-style live updates instead of busy polling.

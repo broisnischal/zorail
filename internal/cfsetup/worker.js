@@ -1,4 +1,4 @@
-// Zorail ingest Worker — deployed by `zmail setup`.
+// Zorail ingest Worker — deployed by `zorail setup`.
 //
 // Cloudflare Email Routing invokes email() once per recipient. We stream the
 // raw RFC822 message straight to the Zorail server's /api/ingest endpoint

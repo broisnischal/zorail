@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -12,13 +13,13 @@ import (
 func Doctor(ctx context.Context, o Options) error {
 	st, err := LoadState()
 	if err != nil {
-		return fmt.Errorf("no saved setup found — run `zmail setup` first (%v)", err)
+		return fmt.Errorf("no saved setup found — run `zorail setup` first (%v)", err)
 	}
 	fmt.Printf("%s\n  domain %s · ingress %s · worker %s\n\n",
-		bold("  zmail doctor"), st.Domain, st.Hostname, st.Worker)
+		bold("  zorail doctor"), st.Domain, st.Hostname, st.Worker)
 
 	if o.EnvFile == "" {
-		o.EnvFile = ".env"
+		o.EnvFile = RepoEnvFile()
 	}
 	if o.ServerURL == "" {
 		o.ServerURL = "http://127.0.0.1:8090"
@@ -46,14 +47,26 @@ func Doctor(ctx context.Context, o Options) error {
 	chk("Cloudflare token", func() (string, error) { return "", cf.VerifyToken(ctx) })
 
 	chk("Email Routing enabled", func() (string, error) {
-		er, err := cf.GetEmailRouting(ctx, st.ZoneID)
+		if er, err := cf.GetEmailRouting(ctx, st.ZoneID); err == nil {
+			if !er.Enabled {
+				return "", fmt.Errorf("not enabled (status %q)", er.Status)
+			}
+			return "  status " + er.Status, nil
+		}
+		// GET /email/routing rejects scoped API tokens (error 10000), so fall
+		// back to confirming the Cloudflare MX records exist — proof that
+		// routing DNS is in place for the domain.
+		recs, err := cf.ListDNS(ctx, st.ZoneID)
 		if err != nil {
 			return "", err
 		}
-		if !er.Enabled {
-			return "", fmt.Errorf("not enabled (status %q)", er.Status)
+		for _, r := range recs {
+			if strings.EqualFold(r.Type, "MX") && strings.EqualFold(r.Name, st.Domain) &&
+				strings.HasSuffix(r.Content, ".mx.cloudflare.net") {
+				return "  MX records present (status flag unreadable via API token)", nil
+			}
 		}
-		return "  status " + er.Status, nil
+		return "", fmt.Errorf("no Cloudflare MX records for %s — enable Email Routing in the dashboard", st.Domain)
 	})
 
 	chk("Catch-all → Worker", func() (string, error) {
@@ -83,7 +96,7 @@ func Doctor(ctx context.Context, o Options) error {
 			return "", err
 		}
 		if !healthy {
-			return "", fmt.Errorf("no active connections — start cloudflared (see `zmail setup`)")
+			return "", fmt.Errorf("no active connections — start cloudflared (see `zorail setup`)")
 		}
 		return "  active", nil
 	})
@@ -107,7 +120,7 @@ func Doctor(ctx context.Context, o Options) error {
 		if token == "" {
 			return "", fmt.Errorf("no server token available ($ZORAIL_TOKEN / %s) to authenticate the probe", o.EnvFile)
 		}
-		probe := fmt.Sprintf("zmail-doctor-%d@%s", time.Now().Unix(), st.Domain)
+		probe := fmt.Sprintf("zorail-doctor-%d@%s", time.Now().Unix(), st.Domain)
 		before, _ := z2(o.ServerURL, token).messageCount(ctx, probe)
 		raw := buildProbe(probe)
 		ingestURL := "https://" + st.Hostname + "/api/ingest"
@@ -141,12 +154,12 @@ func Doctor(ctx context.Context, o Options) error {
 func z2(base, token string) *zorail { return newZorail(base, token) }
 
 func buildProbe(rcpt string) []byte {
-	return []byte("From: zmail doctor <doctor@localhost>\r\n" +
+	return []byte("From: zorail doctor <doctor@localhost>\r\n" +
 		"To: " + rcpt + "\r\n" +
-		"Subject: zmail doctor probe\r\n" +
-		"Message-ID: <" + fmt.Sprint(time.Now().UnixNano()) + "@zmail.doctor>\r\n" +
+		"Subject: zorail doctor probe\r\n" +
+		"Message-ID: <" + fmt.Sprint(time.Now().UnixNano()) + "@zorail.doctor>\r\n" +
 		"\r\n" +
-		"This is an automated connectivity probe from `zmail doctor`.\r\n")
+		"This is an automated connectivity probe from `zorail doctor`.\r\n")
 }
 
 func red(s string) string { return "\x1b[31m" + s + "\x1b[0m" }
