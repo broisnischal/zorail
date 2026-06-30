@@ -22,6 +22,32 @@ func TestCodesAndLinks(t *testing.T) {
 	}
 }
 
+func TestCodeDetectionAccuracy(t *testing.T) {
+	cases := []struct {
+		name, text, want string
+	}{
+		{"keyword beats year", "© 2024 Acme. Your verification code is 553201. Expires in 10 minutes.", "553201"},
+		{"keyword beats order number", "Order 100245 confirmed. Your OTP: 778899", "778899"},
+		{"ignores digits in URLs", "Open https://app.test/v/123456 — your code 998877", "998877"},
+		{"colon separator", "Your login code: 401923", "401923"},
+		{"bare six-digit fallback", "Here it is: 246810 — enter it on the site", "246810"},
+		{"alphanumeric code", "Use code 7H2K9Q to continue", "7H2K9Q"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := From(nil, c.text, "")
+			if len(r.Codes) == 0 || r.Codes[0] != c.want {
+				t.Errorf("codes=%v, want first %q", r.Codes, c.want)
+			}
+		})
+	}
+
+	// A plain year with no code keyword anywhere must NOT be reported as a code.
+	if r := From(nil, "Copyright 2026 Acme Inc. All rights reserved.", ""); len(r.Codes) != 0 {
+		t.Errorf("expected no codes for a bare year, got %v", r.Codes)
+	}
+}
+
 func TestUnsubscribeFromHeader(t *testing.T) {
 	headers := map[string]string{
 		"List-Unsubscribe": "<https://lists.test/u/abc>, <mailto:u@lists.test>",

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from 'vue'
 import {
-  Copy, Trash2, Download, Image, ImageOff, ShieldAlert, Paperclip, Ellipsis,
+  Copy, Trash2, Download, Image, ImageOff, ShieldAlert, Paperclip, Ellipsis, Link2, FileCode2,
 } from 'lucide-vue-next'
 import type { FullMsg } from '~/composables/useZorail'
 import { Button } from '@/components/ui/button'
@@ -23,6 +23,14 @@ const from = computed(() => parseFrom(props.message.from || props.message.env_fr
 const hasHTML = computed(() => !!props.message.html)
 const headerEntries = computed(() => Object.entries(props.message.headers || {}))
 const atts = computed(() => props.message.attachments || [])
+
+// Links/unsubscribe are collapsed by default — most mail has a pile of CDN /
+// social / tracking URLs that just clutter the reader. The code (above) leads.
+const codeList = computed(() => props.message.extracted.codes || [])
+const links = computed(() => props.message.extracted.links || [])
+const unsub = computed(() => props.message.extracted.unsubscribe || [])
+const hasExtras = computed(() => links.value.length > 0 || unsub.value.length > 0)
+const extrasOpen = ref(false)
 
 // remote-image blocking: a CSP meta governs whether the iframe may load remote
 // images. data: URIs are always allowed; remote http(s) only when the user opts in.
@@ -61,11 +69,20 @@ function onload() {
   setTimeout(resize, 120)
   setTimeout(resize, 500)
 }
-watch(() => props.message.id, () => { tab.value = 'rendered' })
+watch(() => props.message.id, () => { tab.value = 'rendered'; extrasOpen.value = false })
 watch(tab, (t) => { if (t === 'rendered') nextTick(resize) })
 
-function downloadEml() {
+// View the raw RFC 5322 source in a new tab.
+function viewRaw() {
   if (import.meta.client) window.open(z.rawURL(props.message.id), '_blank')
+}
+// Save the message as an .eml file.
+function downloadEml() {
+  if (!import.meta.client) return
+  const a = document.createElement('a')
+  a.href = z.rawURL(props.message.id)
+  a.download = `${props.message.id}.eml`
+  a.click()
 }
 
 const spamBadge = computed(() => {
@@ -77,23 +94,41 @@ const spamBadge = computed(() => {
 </script>
 
 <template>
-  <article class="flex flex-col overflow-y-auto animate-in fade-in duration-200">
-    <header class="flex items-start gap-3 px-6 pt-6">
+  <article class="flex h-full min-h-0 flex-col animate-in fade-in duration-200">
+    <!-- compact header band: subject + meta + code chip + actions, one row -->
+    <header class="flex items-start gap-3 border-b border-border-subtle px-5 py-3">
       <div class="min-w-0 flex-1">
-        <h1 class="text-[19px] font-semibold leading-snug tracking-tight">{{ message.subject || '(no subject)' }}</h1>
-        <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12.5px] text-muted-foreground">
+        <h1 class="truncate text-[15px] font-semibold leading-tight tracking-tight">{{ message.subject || '(no subject)' }}</h1>
+        <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[12px] text-muted-foreground">
           <span v-if="from.name" class="font-medium text-foreground">{{ from.name }}</span>
           <span class="truncate font-mono">{{ from.email }}</span>
           <span class="text-muted-foreground/40">·</span>
           <span :title="absTime(message.received_at)">{{ relTime(message.received_at) }} ago</span>
+          <span class="text-muted-foreground/40">·</span>
+          <span class="truncate font-mono text-muted-foreground/70">to {{ (message.to || []).join(', ') || message.inbox }}</span>
           <span
             v-if="message.spam.label !== 'none'"
-            :class="['ml-0.5 inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]', spamBadge]"
+            :class="['inline-flex items-center gap-1 rounded-full border px-1.5 text-[10.5px]', spamBadge]"
             :title="message.spam.reasons.join(' · ')"
           ><ShieldAlert class="size-3" /> spam {{ message.spam.score }}</span>
+          <button
+            v-if="hasExtras"
+            class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11.5px] transition-colors hover:bg-accent hover:text-foreground"
+            :class="extrasOpen ? 'text-foreground' : ''"
+            @click="extrasOpen = !extrasOpen"
+          ><Link2 class="size-3" /> {{ links.length }} link{{ links.length === 1 ? '' : 's' }}<template v-if="unsub.length"> · {{ unsub.length }} unsub</template></button>
         </div>
-        <div class="mt-1 truncate font-mono text-[11.5px] text-muted-foreground/70">to {{ (message.to || []).join(', ') || message.inbox }}</div>
       </div>
+
+      <!-- verification code — compact, copyable chip -->
+      <button
+        v-if="codeList.length"
+        class="group flex shrink-0 items-center gap-2 rounded-lg border bg-muted px-2.5 py-1.5 transition-colors hover:border-border-hover"
+        title="Copy code" @click="z.copy(codeList[0]!, 'code copied')"
+      >
+        <span class="font-mono text-[15px] font-semibold tracking-[0.14em] text-foreground">{{ codeList[0] }}</span>
+        <Copy class="size-3.5 text-muted-foreground transition-colors group-hover:text-foreground" />
+      </button>
 
       <Menu align="end">
         <template #trigger>
@@ -103,100 +138,68 @@ const spamBadge = computed(() => {
           ><Ellipsis class="size-4" /></button>
         </template>
         <MenuItem v-if="from.email" @click="z.copy(from.email, 'address copied')"><Copy /> Copy sender</MenuItem>
+        <MenuItem v-if="codeList.length" @click="z.copy(codeList[0]!, 'code copied')"><Copy /> Copy code</MenuItem>
         <MenuItem v-if="hasRemoteImages" @click="z.toggleImages()">
           <component :is="state.loadImages ? ImageOff : Image" /> {{ state.loadImages ? 'Block remote images' : 'Load remote images' }}
         </MenuItem>
+        <MenuItem @click="viewRaw"><FileCode2 /> View raw source</MenuItem>
         <MenuItem @click="downloadEml"><Download /> Download .eml</MenuItem>
         <Separator class="my-1" />
         <MenuItem danger @click="emit('delete', message.id)"><Trash2 /> Delete message</MenuItem>
       </Menu>
     </header>
 
-    <!-- hero: the one-time code is the job-to-be-done, so it leads -->
-    <div v-if="message.extracted.codes.length" class="px-6 pt-5">
-      <button
-        class="group flex w-full items-center justify-between gap-4 rounded-xl border bg-muted/40 px-5 py-4 text-left transition-colors hover:border-border-hover"
-        @click="z.copy(message.extracted.codes[0]!, 'code copied')"
-      >
-        <div class="min-w-0">
-          <div class="text-[10px] uppercase tracking-wide text-muted-foreground">Verification code</div>
-          <div class="mt-1 truncate font-mono text-2xl font-semibold tracking-[0.18em] text-foreground">{{ message.extracted.codes[0] }}</div>
-        </div>
-        <span class="inline-flex shrink-0 items-center gap-1.5 rounded-lg border bg-background px-3 py-2 text-[12px] text-muted-foreground transition-colors group-hover:text-foreground">
-          <Copy class="size-3.5" /> Copy
-        </span>
-      </button>
-      <div v-if="message.extracted.codes.length > 1" class="mt-2 flex flex-wrap gap-1.5">
-        <button
-          v-for="c in message.extracted.codes.slice(1)" :key="c"
-          class="rounded-md border bg-muted px-2.5 py-1 font-mono text-[12px] text-muted-foreground transition-colors hover:border-border-hover hover:text-foreground"
-          title="copy" @click="z.copy(c, 'code copied')"
-        >{{ c }}</button>
-      </div>
+    <!-- expanded links / unsubscribe — only when toggled, so it never steals space -->
+    <div v-if="hasExtras && extrasOpen" class="flex flex-none flex-wrap gap-1.5 border-b border-border-subtle px-5 py-2.5">
+      <a
+        v-for="l in links" :key="l" :href="l" target="_blank" rel="noopener noreferrer" :title="l"
+        class="inline-block max-w-[220px] truncate rounded-md border bg-muted px-2.5 py-1 font-mono text-[11.5px] text-muted-foreground transition-colors hover:border-border-hover hover:text-foreground"
+      >{{ hostOf(l) }}</a>
+      <a
+        v-for="u in unsub" :key="u" :href="u" target="_blank" rel="noopener noreferrer" :title="u"
+        class="inline-flex max-w-[220px] items-center gap-1 truncate rounded-md border border-warn/30 bg-warn/5 px-2.5 py-1 font-mono text-[11.5px] text-warn/90 transition-colors hover:border-warn/50"
+      >unsub · {{ hostOf(u) }}</a>
     </div>
 
-    <!-- links / unsubscribe — quiet, only when present -->
-    <div
-      v-if="message.extracted.links.length || message.extracted.unsubscribe.length"
-      class="grid gap-2.5 px-6 pt-4"
-    >
-      <div v-if="message.extracted.links.length" class="flex items-start gap-3">
-        <span class="w-12 shrink-0 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">links</span>
-        <div class="flex min-w-0 flex-wrap gap-1.5">
-          <a
-            v-for="l in message.extracted.links" :key="l" :href="l" target="_blank" rel="noopener noreferrer" :title="l"
-            class="rounded-md border bg-muted px-2.5 py-1 font-mono text-xs text-muted-foreground transition-colors hover:border-border-hover hover:text-foreground"
-          >{{ hostOf(l) }}</a>
-        </div>
+    <!-- tabs fill the remaining height -->
+    <Tabs v-model="tab" class="flex min-h-0 flex-1 flex-col gap-0">
+      <div class="flex-none border-b border-border-subtle px-5 py-2">
+        <TabsList class="h-8">
+          <TabsTrigger value="rendered" class="px-3">Rendered</TabsTrigger>
+          <TabsTrigger value="text" class="px-3">Text</TabsTrigger>
+          <TabsTrigger value="headers" class="px-3">Headers <span class="text-[10px] opacity-60">{{ headerEntries.length }}</span></TabsTrigger>
+          <TabsTrigger value="raw" class="px-3">Raw</TabsTrigger>
+          <TabsTrigger value="atts" :disabled="!atts.length" class="px-3">Attachments <span v-if="atts.length" class="text-[10px] opacity-60">{{ atts.length }}</span></TabsTrigger>
+        </TabsList>
       </div>
-      <div v-if="message.extracted.unsubscribe.length" class="flex items-start gap-3">
-        <span class="w-12 shrink-0 pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">unsub</span>
-        <div class="flex min-w-0 flex-wrap gap-1.5">
-          <a
-            v-for="u in message.extracted.unsubscribe" :key="u" :href="u" target="_blank" rel="noopener noreferrer" :title="u"
-            class="rounded-md border bg-muted px-2.5 py-1 font-mono text-xs text-muted-foreground transition-colors hover:border-border-hover hover:text-foreground"
-          >{{ hostOf(u) }}</a>
-        </div>
-      </div>
-    </div>
 
-    <div class="h-5" />
-
-    <!-- tabs -->
-    <Tabs v-model="tab" class="gap-0">
-      <TabsList class="sticky top-0 z-10 w-full justify-start rounded-none border-y border-border-subtle bg-background px-4">
-        <TabsTrigger value="rendered">rendered</TabsTrigger>
-        <TabsTrigger value="text">text</TabsTrigger>
-        <TabsTrigger value="headers">headers <span class="text-[10px] text-muted-foreground">{{ headerEntries.length }}</span></TabsTrigger>
-        <TabsTrigger value="raw">raw</TabsTrigger>
-        <TabsTrigger value="atts" :disabled="!atts.length">attachments <span v-if="atts.length" class="text-[10px] text-muted-foreground">{{ atts.length }}</span></TabsTrigger>
-      </TabsList>
-
-      <TabsContent value="rendered" class="p-6">
+      <!-- rendered: full-bleed white surface that fills the whole reader -->
+      <TabsContent value="rendered" class="relative min-h-0 flex-1 overflow-auto bg-white p-0">
         <div
           v-if="hasRemoteImages && !state.loadImages"
-          class="mb-3 flex items-center justify-between gap-2.5 rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground"
+          class="sticky top-0 z-10 flex items-center justify-between gap-2.5 border-b border-black/10 bg-white/95 px-4 py-2 text-xs text-black/60 backdrop-blur"
         >
-          <span class="inline-flex items-center gap-1.5"><ImageOff class="size-3.5" /> Remote images blocked (privacy / tracking protection).</span>
-          <Button variant="outline" size="sm" @click="z.toggleImages()"><Image /> Load images</Button>
+          <span class="inline-flex items-center gap-1.5"><ImageOff class="size-3.5" /> Remote images blocked.</span>
+          <button
+            class="inline-flex items-center gap-1.5 rounded-md border border-black/15 px-2 py-1 text-black/70 transition-colors hover:bg-black/5"
+            @click="z.toggleImages()"
+          ><Image class="size-3.5" /> Load images</button>
         </div>
-        <div class="overflow-hidden rounded-xl border bg-white">
-          <iframe
-            ref="iframe"
-            class="block min-h-[200px] w-full border-0 bg-white"
-            sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-            :srcdoc="srcdoc"
-            title="message body"
-            @load="onload"
-          />
-        </div>
+        <iframe
+          ref="iframe"
+          class="block w-full border-0 bg-white"
+          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          :srcdoc="srcdoc"
+          title="message body"
+          @load="onload"
+        />
       </TabsContent>
 
-      <TabsContent value="text" class="p-6">
-        <pre class="m-0 max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-xl border bg-muted p-4 font-mono text-xs text-muted-foreground">{{ message.text || '(no plain-text part)' }}</pre>
+      <TabsContent value="text" class="min-h-0 flex-1 overflow-auto p-5">
+        <pre class="m-0 whitespace-pre-wrap break-words rounded-xl border bg-muted p-4 font-mono text-xs text-muted-foreground">{{ message.text || '(no plain-text part)' }}</pre>
       </TabsContent>
 
-      <TabsContent value="headers" class="p-6">
+      <TabsContent value="headers" class="min-h-0 flex-1 overflow-auto p-5">
         <div class="grid gap-1">
           <div v-for="[k, v] in headerEntries" :key="k" class="flex gap-2.5 font-mono text-[11.5px]">
             <span class="w-[150px] shrink-0 text-muted-foreground">{{ k }}</span>
@@ -205,11 +208,11 @@ const spamBadge = computed(() => {
         </div>
       </TabsContent>
 
-      <TabsContent value="raw" class="p-6">
-        <pre class="m-0 max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-xl border bg-muted p-4 font-mono text-xs text-muted-foreground">{{ raw || '(loading…)' }}</pre>
+      <TabsContent value="raw" class="min-h-0 flex-1 overflow-auto p-5">
+        <pre class="m-0 whitespace-pre-wrap break-words rounded-xl border bg-muted p-4 font-mono text-xs text-muted-foreground">{{ raw || '(loading…)' }}</pre>
       </TabsContent>
 
-      <TabsContent value="atts" class="p-6">
+      <TabsContent value="atts" class="min-h-0 flex-1 overflow-auto p-5">
         <div class="flex flex-wrap gap-1.5">
           <a
             v-for="a in atts" :key="a.id" :href="z.attachmentURL(message.id, a.id)"

@@ -7,6 +7,7 @@ package extract
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -18,14 +19,19 @@ type Result struct {
 }
 
 var (
-	tagRe         = regexp.MustCompile(`(?s)<[^>]+>`)
-	wsRe          = regexp.MustCompile(`\s+`)
-	linkRe        = regexp.MustCompile(`https?://[^\s"'<>)\]}]+`)
-	hrefRe        = regexp.MustCompile(`(?i)href\s*=\s*["']?(https?://[^\s"'<>]+)`)
-	codeKeywordRe = regexp.MustCompile(`(?i)(?:code|otp|one[\s-]?time|verification|verify|passcode|pin|token|confirm(?:ation)?)[^0-9a-z]{0,24}([0-9]{4,8}|[A-Z0-9]{4,8})`)
-	bare6Re       = regexp.MustCompile(`\b\d{6}\b`)
-	unsubBodyRe   = regexp.MustCompile(`(?i)https?://[^\s"'<>)\]}]*unsub[^\s"'<>)\]}]*`)
-	angleRe       = regexp.MustCompile(`<([^>]+)>`)
+	tagRe       = regexp.MustCompile(`(?s)<[^>]+>`)
+	wsRe        = regexp.MustCompile(`\s+`)
+	linkRe      = regexp.MustCompile(`https?://[^\s"'<>)\]}]+`)
+	hrefRe      = regexp.MustCompile(`(?i)href\s*=\s*["']?(https?://[^\s"'<>]+)`)
+	unsubBodyRe = regexp.MustCompile(`(?i)https?://[^\s"'<>)\]}]*unsub[^\s"'<>)\]}]*`)
+	angleRe     = regexp.MustCompile(`<([^>]+)>`)
+
+	// A code candidate: a 4–8 char run of digits or UPPERCASE alphanumerics.
+	// Case-sensitive on purpose — ordinary lowercase words must not match.
+	codeTokenRe = regexp.MustCompile(`\b[0-9A-Z]{4,8}\b`)
+	// Words that, when they appear just before a candidate, mark it as a real
+	// one-time code. Matched against the preceding context window.
+	codeWordRe = regexp.MustCompile(`(?i)(code|otp|one[\s-]?time|verification|verify|passcode|pin\b|token|2fa|auth|security|confirm)`)
 )
 
 // StripHTML reduces an HTML body to rough plain text for keyword scanning.
@@ -51,20 +57,96 @@ func From(headers map[string]string, text, html string) Result {
 	}
 }
 
+// codes finds one-time codes by scoring every candidate token: a candidate with
+// a code keyword right before it wins decisively, years and digits inside URLs
+// are excluded, and a bare 6-digit number is only used as a last resort. This
+// fixes the old behavior of grabbing the first stray 6-digit number it saw.
 func codes(plain string) []string {
+	// Blank out URLs so digits inside links (?token=123456, /v/998877) never
+	// register as codes.
+	scan := linkRe.ReplaceAllStringFunc(plain, func(u string) string {
+		return strings.Repeat(" ", len(u))
+	})
+	lower := strings.ToLower(scan)
+
+	type cand struct {
+		val   string
+		score int
+		pos   int
+	}
+	var cands []cand
+	for _, loc := range codeTokenRe.FindAllStringIndex(scan, -1) {
+		tok := scan[loc[0]:loc[1]]
+		if !hasDigit(tok) {
+			continue // all-letter uppercase runs (e.g. "HELLO") aren't codes
+		}
+		score := lengthScore(len(tok))
+		// keyword in the ~40 chars before the token → strong signal.
+		start := loc[0] - 40
+		if start < 0 {
+			start = 0
+		}
+		if codeWordRe.MatchString(lower[start:loc[0]]) {
+			score += 100
+		}
+		if isYearLike(tok) {
+			score -= 80 // 1998 / 2026 etc. are almost never codes
+		}
+		cands = append(cands, cand{tok, score, loc[0]})
+	}
+
+	// Highest score first; ties broken by earliest position (reading order).
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].score != cands[j].score {
+			return cands[i].score > cands[j].score
+		}
+		return cands[i].pos < cands[j].pos
+	})
+
 	set := newOrderedSet()
-	for _, m := range codeKeywordRe.FindAllStringSubmatch(plain, -1) {
-		// The alnum branch is case-insensitive, so it can capture plain words
-		// like "code" or "token"; a real OTP always contains a digit.
-		if hasDigit(m[1]) {
-			set.add(m[1])
+	for _, c := range cands {
+		if c.score > 0 && c.score >= 100 { // confident: keyword-associated
+			set.add(c.val)
 		}
 	}
-	// Standalone 6-digit numbers are very commonly OTPs even without a keyword.
-	for _, m := range bare6Re.FindAllString(plain, -1) {
-		set.add(m)
+	// Fallback: no keyword context anywhere → the classic standalone 6-digit OTP.
+	if len(set.items) == 0 {
+		for _, c := range cands {
+			if len(c.val) == 6 && allDigits(c.val) && !isYearLike(c.val) {
+				set.add(c.val)
+				break
+			}
+		}
 	}
-	return set.slice(8)
+	return set.slice(6)
+}
+
+// lengthScore nudges toward the most common OTP lengths (6, then 4/5/7/8).
+func lengthScore(n int) int {
+	switch n {
+	case 6:
+		return 12
+	case 4, 5:
+		return 6
+	default:
+		return 5
+	}
+}
+
+func isYearLike(s string) bool {
+	if len(s) != 4 || !allDigits(s) {
+		return false
+	}
+	return s >= "1900" && s <= "2099"
+}
+
+func allDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
 }
 
 func hasDigit(s string) bool {

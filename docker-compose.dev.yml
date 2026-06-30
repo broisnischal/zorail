@@ -1,0 +1,54 @@
+# Dockerized development stack with live reload.
+#
+#   make docker-dev          # or: docker compose -f docker-compose.dev.yml up --build
+#
+#   • UI    → http://localhost:3000   (Nuxt dev server, instant HMR on save)
+#   • API   → http://localhost:8090   (Go server, air rebuilds on .go save)
+#   • SMTP  → localhost:1025          (send test mail here)
+#
+# Source is bind-mounted, so edits on the host reload inside the containers.
+# The DB persists in the zorail-dev-data volume across restarts.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /src
+    command: air -c .air.toml
+    environment:
+      ZORAIL_HTTP_ADDR: ":8090"
+      ZORAIL_SMTP_ADDR: ":1025"
+      ZORAIL_DOMAIN: "localhost"
+      ZORAIL_DB_PATH: "/data/zorail.db"
+      # Accept every recipient domain in dev (open catch-all). Override as needed.
+      ZORAIL_ALLOWED_DOMAINS: ""
+      ZORAIL_LOG_LEVEL: "debug"
+    volumes:
+      - .:/src                       # live source → air rebuilds on save
+      - go-build-cache:/root/.cache/go-build
+      - go-mod-cache:/go/pkg/mod
+      - zorail-dev-data:/data        # persistent SQLite across restarts
+    ports:
+      - "8090:8090"   # API (direct)
+      - "1025:1025"   # inbound SMTP
+
+  ui:
+    image: node:24-alpine
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm install && pnpm dev --host 0.0.0.0"
+    environment:
+      # Point the Nuxt dev proxy at the backend service (see nuxt.config.ts).
+      NUXT_DEV_API_PROXY: "http://backend:8090"
+    volumes:
+      - ./ui:/app                    # live UI source → Nuxt HMR
+      - ui-node-modules:/app/node_modules  # keep container's node_modules isolated
+    ports:
+      - "3000:3000"   # open this in the browser
+    depends_on:
+      - backend
+
+volumes:
+  zorail-dev-data:
+  go-build-cache:
+  go-mod-cache:
+  ui-node-modules:

@@ -111,7 +111,7 @@
   --color-border-subtle: var(--bd-subtle);
   --color-border-hover: var(--bd-hover);
 
-  --font-sans: "Geist", system-ui, -apple-system, sans-serif;
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
 
   --radius-sm: calc(var(--radius) - 4px);

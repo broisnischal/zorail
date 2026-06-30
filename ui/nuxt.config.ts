@@ -19,13 +19,15 @@ export default defineNuxtConfig({
   shadcn: { prefix: '', componentDir: '~/components/ui' },
   fonts: {
     families: [
-      { name: 'Geist', provider: 'google', weights: [400, 500, 600, 700] },
+      { name: 'Inter', provider: 'google', weights: [400, 500, 600, 700] },
       { name: 'Geist Mono', provider: 'google', weights: [400, 500, 600] },
     ],
   },
 
   app: {
     baseURL: '/',
+    // Client-side route transitions reuse the `.page-*` classes in main.css.
+    pageTransition: { name: 'page', mode: 'out-in' },
     head: {
       title: 'zorail',
       meta: [
@@ -49,9 +51,15 @@ export default defineNuxtConfig({
   // In dev (nuxt on :3000), proxy API calls to the Go server on :8090 so the
   // frontend always talks to a same-origin /api path. In production the Go
   // server serves both the static UI and /api, so no proxy is needed.
+  // In dev, proxy /api to the Go server. Target is overridable so the same
+  // config works locally (127.0.0.1:8090) and in Docker (http://backend:8090),
+  // set via NUXT_DEV_API_PROXY in docker-compose.dev.yml.
   nitro: {
     devProxy: {
-      '/api': { target: 'http://127.0.0.1:8090/api', changeOrigin: true },
+      '/api': {
+        target: `${process.env.NUXT_DEV_API_PROXY || 'http://127.0.0.1:8090'}/api`,
+        changeOrigin: true,
+      },
     },
   },
 })

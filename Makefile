@@ -1,6 +1,7 @@
-.PHONY: build run dev ui ui-install test tidy clean docker send-test
+.PHONY: build run dev docker-dev docker-dev-down ui ui-install test tidy clean docker send-test cli watch
 
 BIN     := bin/zorail
+CLI_BIN := bin/zmail
 UI_DIR  := ui
 WEB_OUT := internal/api/web
 
@@ -21,10 +22,37 @@ build:
 run:
 	ZORAIL_SMTP_ADDR=:1025 ZORAIL_HTTP_ADDR=:8090 ZORAIL_DOMAIN=localhost go run ./cmd/zorail
 
+# Build the interactive terminal client (zmail).
+cli:
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(CLI_BIN) ./cmd/zmail
+
+# Launch the live terminal inbox viewer against a running server (make run).
+# Override the target with URL=… TOKEN=…  e.g.  make watch URL=https://mail.example.com
+watch:
+	go run ./cmd/zmail $(if $(URL),--url $(URL),) $(if $(TOKEN),--token $(TOKEN),)
+
+# Connect a real domain's inbound mail to this server (Cloudflare automation).
+#   make setup DOMAIN=example.com      (prompts for the Cloudflare API token)
+setup:
+	go run ./cmd/zmail setup $(if $(DOMAIN),--domain $(DOMAIN),)
+
+# Verify the inbound mail pipeline end-to-end.
+doctor:
+	go run ./cmd/zmail doctor
+
 # Frontend hot-reload dev server (proxies /api -> :8090). Run `make run` in a
 # second terminal so the API is live, then open http://localhost:3000.
 dev:
 	cd $(UI_DIR) && pnpm dev
+
+# Fully dockerized dev stack with live reload (no local Go/Node needed):
+#   UI  http://localhost:3000 (Nuxt HMR) · API :8090 (air) · SMTP :1025.
+# Source is bind-mounted; saving .go rebuilds the API, saving ui/ hot-reloads.
+docker-dev:
+	docker compose -f docker-compose.dev.yml up --build
+
+docker-dev-down:
+	docker compose -f docker-compose.dev.yml down
 
 # Send a sample email to the locally running server (run `make run` first).
 send-test:

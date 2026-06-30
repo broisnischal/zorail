@@ -149,26 +149,38 @@ async function loadMessages() {
   })
   state.loadingInbox = false
 }
-async function openInbox(inbox: string) {
-  state.section = 'inboxes'
-  state.inbox = inbox.trim().toLowerCase()
+// Routes own navigation now: openInbox/closeInbox/setSection just navigate, and
+// the pages call enterInbox/leaveInbox to sync state to the URL.
+const SECTION_PATH: Record<Section, string> = {
+  inboxes: '/', addresses: '/addresses', domains: '/domains', keys: '/keys', settings: '/settings',
+}
+function openInbox(inbox: string) {
+  return navigateTo('/inbox/' + encodeURIComponent(inbox.trim().toLowerCase()))
+}
+function closeInbox() {
+  return navigateTo('/')
+}
+function setSection(s: Section) {
+  return navigateTo(SECTION_PATH[s])
+}
+
+// enterInbox is called by the /inbox/[address] page to load a URL-addressed
+// inbox; leaveInbox by the landing page to drop inbox state so polling stops.
+async function enterInbox(inbox: string) {
+  inbox = inbox.trim().toLowerCase()
+  if (state.inbox === inbox && state.messages.length) { loadMessages(); return }
+  state.inbox = inbox
   state.searchQuery = ''
   state.current = null
   pushRecent(state.inbox)
   await loadMessages()
   await loadInboxes()
 }
-// closeInbox returns to the inbox list (master view) within the Inboxes section.
-function closeInbox() {
+function leaveInbox() {
   state.inbox = ''
   state.current = null
   state.messages = []
   state.searchQuery = ''
-}
-function setSection(s: Section) {
-  state.section = s
-  if (s === 'addresses') loadAddresses()
-  if (s === 'keys') loadKeys()
 }
 async function openMessage(id: string) {
   state.loadingMsg = true
@@ -444,7 +456,7 @@ function init() {
 export function useZorail() {
   return {
     state, init,
-    loadConfig, loadInboxes, loadMessages, openInbox, closeInbox, setSection, openMessage, deleteMessage, clearInbox, search,
+    loadConfig, loadInboxes, loadMessages, openInbox, closeInbox, enterInbox, leaveInbox, setSection, openMessage, deleteMessage, clearInbox, search,
     attachmentURL, rawURL, generateAddress,
     markRead, isRead, inboxUnread, togglePin, isPinned, recentInboxes,
     setTheme, setAccent, setToken, toggleImages, toggleAuto, accentList,

@@ -131,19 +131,34 @@ func spaHandler(fsys fs.FS) http.HandlerFunc {
 	fileServer := http.FileServerFS(fsys)
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
-		if name == "" {
-			name = "index.html"
+		// Serve a real, non-directory file (assets like /_nuxt/*, /favicon, …)
+		// directly. Everything else — including client-routed paths such as
+		// /addresses or /inbox/<addr> — is the SPA: hand back index.html at 200
+		// so the router takes over (no trailing-slash 301 round-trip).
+		if name != "" {
+			if f, err := fsys.Open(name); err == nil {
+				info, statErr := f.Stat()
+				_ = f.Close()
+				if statErr == nil && !info.IsDir() {
+					fileServer.ServeHTTP(w, r)
+					return
+				}
+			}
 		}
-		if f, err := fsys.Open(name); err == nil {
-			_ = f.Close()
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-		// Unknown path: hand the SPA entry point to the client router.
-		clone := r.Clone(r.Context())
-		clone.URL.Path = "/"
-		fileServer.ServeHTTP(w, clone)
+		serveIndex(fsys, w)
 	}
+}
+
+// serveIndex writes the embedded SPA entry point with a 200 status.
+func serveIndex(fsys fs.FS, w http.ResponseWriter) {
+	b, err := fs.ReadFile(fsys, "index.html")
+	if err != nil {
+		http.Error(w, "ui not built", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
 }
 
 // ListenAndServe blocks serving HTTP.

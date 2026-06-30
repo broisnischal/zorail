@@ -1,0 +1,24 @@
+# air (https://github.com/air-verse/air) — rebuilds & restarts the Go server on
+# every .go save. Used by the backend service in docker-compose.dev.yml so the
+# API hot-reloads in Docker, mirroring the Nuxt dev server's HMR for the UI.
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/zorail ./cmd/zorail"
+  bin = "./tmp/zorail"
+  include_ext = ["go"]
+  # The UI is served by the Nuxt dev server in dev; never rebuild Go for it, and
+  # skip generated/vendored trees so a save triggers exactly one fast rebuild.
+  exclude_dir = ["ui", "internal/api/web", "bin", "tmp", "scripts", "docs", ".git"]
+  exclude_regex = ["_test\\.go"]
+  delay = 400          # ms debounce — coalesce rapid saves into one rebuild
+  stop_on_error = true
+  send_interrupt = true
+  kill_delay = "1s"
+
+[misc]
+  clean_on_exit = true
+
+[log]
+  time = true

@@ -1,0 +1,19 @@
+# Development image for the Go backend: a full toolchain plus `air` for
+# hot-reload. Source is bind-mounted at runtime (see docker-compose.dev.yml), so
+# editing any .go file rebuilds and restarts the server inside the container.
+# This is NOT the production image — that stays the tiny distroless build in
+# ./Dockerfile.
+FROM golang:1.25
+
+# air: file-watcher that rebuilds + restarts the binary on change.
+RUN go install github.com/air-verse/air@latest
+
+WORKDIR /src
+
+# Warm the module cache into an image layer. The bind mount shadows /src at run
+# time, but the module cache lives under /go (outside /src) and persists.
+COPY go.mod go.sum ./
+RUN go mod download
+
+EXPOSE 8090 1025
+CMD ["air", "-c", ".air.toml"]

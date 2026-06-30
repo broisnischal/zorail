@@ -174,6 +174,76 @@ signup → `wait_for_message` → read the code.
 // Header:        Authorization: Bearer zk_…
 ```
 
+## zmail — live terminal client
+
+`zmail` is an interactive TUI that watches your inboxes **live in the terminal** —
+no browser. It talks to a running server over the same JSON API (including the
+long-poll `/wait` endpoint), so new mail pushes in instantly, and it works
+against a local or remote server.
+
+```bash
+make cli                       # build bin/zmail
+./bin/zmail                    # connect to http://127.0.0.1:8090 (default)
+./bin/zmail --url https://mail.example.com --token zk_…   # remote + auth
+# or, without building:        make watch URL=… TOKEN=…
+```
+
+Environment: `ZORAIL_URL` (default `http://127.0.0.1:8090`) and `ZORAIL_TOKEN`.
+
+A three-pane browser — inboxes · messages · reader — that auto-refreshes and
+flashes when mail lands. Detected OTP **codes** and **links** are surfaced at the
+top of each message and copyable with one key (clipboard + OSC52, so it works
+over SSH too).
+
+```
+ zorail zmail  ·  ● live                                    3 inboxes · @localhost
+╭ INBOXES  3 ─╮╭ INBOX watch-me@localhost ─╮╭ Verify your account ──────────╮
+│ ▎ watch-me  ││ ▎ stripe@billing.test     ││ from  noreply@myapp.test       │
+│   now       ││   now                     ││ date  Jun 30 15:49 · now ago   │
+│   2 msg     ││   Your receipt            ││ CODES                          │
+│   qa-1      ││   noreply@myapp.test      ││  884217                        │
+│   19m       ││   16s                     ││ ─────────────────────────────  │
+│   1 msg     ││   Verify your account     ││ Your verification code is …    │
+╰─────────────╯╰───────────────────────────╯╰────────────────────────────────╯
+ ✦ new mail · Your receipt        j/k move  ↵ read  c code  y copy  / search  ? help
+```
+
+Keys: `j/k` move · `↵` drill in · `←/esc` back · `tab` switch pane · `g` generate
+address · `c` copy code · `y` copy address/sender · `d` delete · `D` clear inbox ·
+`/` search (across all inboxes) · `r` refresh · `?` help · `q` quit.
+
+### Receive real mail on localhost — `zmail setup`
+
+`zmail setup` wires a real domain's inbound mail into your localhost server in
+one shot, using **Cloudflare Email Routing + an Email Worker + a Cloudflare
+Tunnel** — no public IP, no open port 25, free:
+
+```
+sender → Cloudflare (MX) → Email Worker → HTTPS POST /api/ingest
+                                              ↑
+                          Cloudflare Tunnel (cloudflared) → your localhost:8090
+```
+
+Run it on the machine hosting the server (the domain must already be on
+Cloudflare). With a Cloudflare API token it automatically: creates a Tunnel and
+points a hostname at `localhost`, deploys the ingest Worker, enables Email
+Routing and adds the MX/SPF records, and sets a catch-all rule `*@domain →
+Worker`. It also locks down the server (provisions `ZORAIL_API_TOKEN`) so the
+now-public ingest endpoint can't be abused.
+
+```bash
+make cli                                   # build bin/zmail
+./bin/zmail setup --domain example.com     # or: make setup DOMAIN=example.com
+# then run the tunnel it prints (once, persistent):
+sudo cloudflared service install <token>
+./bin/zmail doctor                         # verify the whole pipeline end-to-end
+```
+
+The Cloudflare API token needs **Zone:Email Routing, Zone:DNS, Account:Workers
+Scripts, Account:Cloudflare Tunnel** edit permissions. `zmail doctor` re-checks
+every link (routing, worker, tunnel health, server auth) and pushes a live probe
+through the public ingress to confirm mail reaches your inbox.
+
 ## Quick start
 
 ### Local (dev)
