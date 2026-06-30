@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strconv"
@@ -64,8 +65,13 @@ func (c *Config) BounceFrom() string {
 	return "bounces@" + d
 }
 
-// Load reads configuration from the environment, applying defaults.
+// Load reads configuration from the environment, applying defaults. A `.env`
+// file in the working directory (or the path in ZORAIL_ENV_FILE) is loaded
+// first, so `ZORAIL_DOMAIN=…` in a file works without exporting it. Real
+// environment variables always win over the file.
 func Load() (*Config, error) {
+	loadDotEnv(env("ZORAIL_ENV_FILE", ".env"))
+
 	c := &Config{
 		SMTPAddr:        env("ZORAIL_SMTP_ADDR", ":1025"),
 		Domain:          env("ZORAIL_DOMAIN", "localhost"),
@@ -107,6 +113,39 @@ func (c *Config) AllowsRecipient(addr string) bool {
 		}
 	}
 	return false
+}
+
+// loadDotEnv reads simple KEY=VALUE lines from path (if it exists) and sets any
+// keys not already present in the environment. Lines may be blank, `# comments`,
+// or `export KEY=value`; values may be single/double quoted. It is intentionally
+// dependency-free and forgiving — a malformed line is skipped, never fatal.
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return // no file → nothing to do
+	}
+	defer func() { _ = f.Close() }()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			val = val[1 : len(val)-1]
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			_ = os.Setenv(key, val)
+		}
+	}
 }
 
 func env(key, def string) string {

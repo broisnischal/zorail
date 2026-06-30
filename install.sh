@@ -81,8 +81,11 @@ ensure_docker() {
 
 # ---- 2. config ---------------------------------------------------------------
 gather_config() {
-  prompt DOMAIN  "Mail domain (the part after @)" "${DOMAIN:-mail.example.com}"
-  prompt ALLOWED "Accepted recipient domains (comma-separated)" "${ALLOWED:-$DOMAIN}"
+  prompt DOMAIN  "Mail domain (used for generated addresses)" "${DOMAIN:-mail.example.com}"
+  # Empty = accept mail for EVERY recipient domain (open catch-all). This is the
+  # default: any address whose MX points here is accepted. Set a comma-separated
+  # list only if you want to restrict which domains this server will receive for.
+  prompt ALLOWED "Restrict to domains (comma-separated, blank = accept all)" "${ALLOWED:-}"
   prompt HTTP_PORT "Dashboard / API port" "$HTTP_PORT"
   prompt SMTP_PORT "Inbound SMTP port" "$SMTP_PORT"
 }
@@ -100,13 +103,20 @@ run_container() {
   docker volume create "$DATA_VOLUME" >/dev/null
 
   info "Starting Zorail…"
+  # Only pin ZORAIL_ALLOWED_DOMAINS when the operator set one; leaving it unset
+  # means accept-all (every recipient domain), which is the default.
+  local allowed_args=()
+  if [ -n "$ALLOWED" ]; then
+    allowed_args=(-e "ZORAIL_ALLOWED_DOMAINS=$ALLOWED")
+  fi
+
   docker run -d \
     --name "$CONTAINER" \
     --restart unless-stopped \
     -p "${HTTP_PORT}:8080" \
     -p "${SMTP_PORT}:25" \
     -e ZORAIL_DOMAIN="$DOMAIN" \
-    -e ZORAIL_ALLOWED_DOMAINS="$ALLOWED" \
+    "${allowed_args[@]}" \
     -e ZORAIL_SMTP_ADDR=":25" \
     -e ZORAIL_HTTP_ADDR=":8080" \
     -e ZORAIL_DB_PATH="/data/zorail.db" \
@@ -132,6 +142,7 @@ $(ok "Zorail is running.")
   ${BOLD}Open it${RESET}     to finish setup — create your admin account & organization.
 
   ${DIM}Mail domain${RESET}  ${DOMAIN}
+  ${DIM}Accepting${RESET}    $([ -n "$ALLOWED" ] && printf '%s' "$ALLOWED" || printf 'all domains (open catch-all)')
   ${DIM}SMTP${RESET}         port ${SMTP_PORT}  (point your domain's MX record here)
   ${DIM}Data${RESET}         docker volume '${DATA_VOLUME}'  (survives upgrades)
 

@@ -327,7 +327,9 @@ Next, in priority order:
 - Disposable/reserved modes are **receive-only**. **Forwarding sends** — it is
   delegated to a relay/Cloudflare and only delivers to **verified** destinations,
   so Zorail is not an open relay.
-- Always set `ZORAIL_ALLOWED_DOMAINS` in production so you are not an open sink.
+- By default `ZORAIL_ALLOWED_DOMAINS` is unset → Zorail accepts mail for **every**
+  recipient domain whose MX points at it (open catch-all). Set it to a
+  comma-separated list only if you want to restrict which domains are accepted.
 - Set `ZORAIL_API_TOKEN` (admin) and/or use scoped `zk_` keys; keys are stored as
   sha-256 hashes, passwords as bcrypt.
 - Run behind a firewall or TLS terminator; STARTTLS support is wired in

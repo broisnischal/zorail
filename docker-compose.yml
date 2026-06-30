@@ -12,8 +12,9 @@ services:
       - "8080:8080"
     environment:
       ZORAIL_DOMAIN: "mail.yourorg.test"
-      # Restrict the catch-all to domains you control. Comma-separated.
-      ZORAIL_ALLOWED_DOMAINS: "mail.yourorg.test"
+      # Accept mail for EVERY recipient domain by default (open catch-all): leave
+      # ZORAIL_ALLOWED_DOMAINS unset. Uncomment to restrict to domains you control:
+      # ZORAIL_ALLOWED_DOMAINS: "mail.yourorg.test,other.example"
       ZORAIL_MAX_MESSAGE_BYTES: "26214400" # 25 MiB
       ZORAIL_LOG_LEVEL: "info"
       ZORAIL_DB_PATH: "/data/zorail.db"

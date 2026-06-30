@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	gosmtp "github.com/emersion/go-smtp"
@@ -49,10 +50,18 @@ func (s *Session) Mail(from string, _ *gosmtp.MailOptions) error {
 // Rcpt records a recipient (RCPT TO) if its domain is in scope.
 func (s *Session) Rcpt(to string, _ *gosmtp.RcptOptions) error {
 	if !s.be.cfg.AllowsRecipient(to) {
+		// Log loudly: this is the #1 "why isn't mail arriving?" cause, and the
+		// fix (set ZORAIL_ALLOWED_DOMAINS) is invisible without this line.
+		s.be.log.Warn("rejected recipient: domain not in ZORAIL_ALLOWED_DOMAINS",
+			"rcpt", to, "handled_domains", s.be.cfg.AllowedDomains, "remote", s.remote)
+		msg := "Recipient domain not handled by this server"
+		if len(s.be.cfg.AllowedDomains) > 0 {
+			msg += "; this server handles: " + strings.Join(s.be.cfg.AllowedDomains, ", ")
+		}
 		return &gosmtp.SMTPError{
 			Code:         550,
 			EnhancedCode: gosmtp.EnhancedCode{5, 1, 1},
-			Message:      "Recipient domain not handled by this server",
+			Message:      msg,
 		}
 	}
 	s.rcpts = append(s.rcpts, to)

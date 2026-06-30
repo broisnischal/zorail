@@ -78,7 +78,13 @@ const state = reactive({
   organization: '',
   needsSetup: false,
   setupChecked: false,
+  // navigation (Resend-style sections)
+  section: 'inboxes' as Section,
+  // sign-in is optional after setup; this toggles the sign-in overlay
+  signinOpen: false,
 })
+
+export type Section = 'inboxes' | 'addresses' | 'domains' | 'keys' | 'settings'
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 const enc = encodeURIComponent
@@ -122,12 +128,25 @@ async function loadMessages() {
   state.loadingInbox = false
 }
 async function openInbox(inbox: string) {
+  state.section = 'inboxes'
   state.inbox = inbox.trim().toLowerCase()
   state.searchQuery = ''
   state.current = null
   pushRecent(state.inbox)
   await loadMessages()
   await loadInboxes()
+}
+// closeInbox returns to the inbox list (master view) within the Inboxes section.
+function closeInbox() {
+  state.inbox = ''
+  state.current = null
+  state.messages = []
+  state.searchQuery = ''
+}
+function setSection(s: Section) {
+  state.section = s
+  if (s === 'addresses') loadAddresses()
+  if (s === 'keys') loadKeys()
 }
 async function openMessage(id: string) {
   state.loadingMsg = true
@@ -289,8 +308,12 @@ async function login(email: string, password: string): Promise<void> {
   // The login token is a manage-scoped key; store it as the active bearer.
   state.token = res.token
   if (import.meta.client) localStorage.setItem(LS.token, res.token)
+  state.signinOpen = false
   await Promise.all([loadConfig(), loadInboxes(), loadAddresses(), loadKeys()])
 }
+
+function openSignIn() { state.signinOpen = true }
+function closeSignIn() { state.signinOpen = false }
 
 function logout() {
   setUser(null)
@@ -399,14 +422,14 @@ function init() {
 export function useZorail() {
   return {
     state, init,
-    loadConfig, loadInboxes, loadMessages, openInbox, openMessage, deleteMessage, clearInbox, search,
+    loadConfig, loadInboxes, loadMessages, openInbox, closeInbox, setSection, openMessage, deleteMessage, clearInbox, search,
     attachmentURL, rawURL, generateAddress,
     markRead, isRead, inboxUnread, togglePin, isPinned, recentInboxes,
     setTheme, setAccent, setToken, toggleImages, toggleAuto, accentList,
     toast, copy, startPolling, stopPolling,
     // multi-tenant
     loadSetup, setup,
-    isAuthed, register, login, logout,
+    isAuthed, register, login, logout, openSignIn, closeSignIn,
     loadKeys, createKey, deleteKey,
     loadAddresses, reserveAddress, updateAddress, releaseAddress, requestVerify,
     waitForNext, errMsg,
