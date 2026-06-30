@@ -31,8 +31,37 @@ type Config struct {
 	// Storage.
 	DBPath string // path to the SQLite database file
 
+	// Retention. Disposable inboxes older than this are swept. Zero disables
+	// sweeping; reserved/forward addresses are always exempt.
+	RetentionDays int
+
+	// Forwarding relay (smarthost). When RelayHost is set, the forward worker
+	// delivers queued messages through it. Leave empty to delegate forwarding
+	// to Cloudflare Email Routing (Zorail then only stores copies).
+	RelayHost       string // relay hostname (e.g. smtp.resend.com)
+	RelayPort       int    // relay port (587 for STARTTLS submission)
+	RelayUser       string // relay username (empty = no auth)
+	RelayPass       string // relay password
+	RelayFrom       string // envelope MAIL FROM for forwards (SRS-lite); defaults to bounces@Domain
+	ForwardMaxTries int    // give up after this many delivery attempts
+
 	// LogLevel: "debug" | "info" | "warn" | "error".
 	LogLevel string
+}
+
+// RelayEnabled reports whether an outbound relay is configured.
+func (c *Config) RelayEnabled() bool { return c.RelayHost != "" }
+
+// BounceFrom returns the envelope sender used for forwarded mail.
+func (c *Config) BounceFrom() string {
+	if c.RelayFrom != "" {
+		return c.RelayFrom
+	}
+	d := c.Domain
+	if len(c.AllowedDomains) > 0 {
+		d = c.AllowedDomains[0]
+	}
+	return "bounces@" + d
 }
 
 // Load reads configuration from the environment, applying defaults.
@@ -46,6 +75,13 @@ func Load() (*Config, error) {
 		HTTPAddr:        env("ZORAIL_HTTP_ADDR", ":8080"),
 		APIToken:        env("ZORAIL_API_TOKEN", ""),
 		DBPath:          env("ZORAIL_DB_PATH", "zorail.db"),
+		RetentionDays:   int(envInt64("ZORAIL_RETENTION_DAYS", 0)),
+		RelayHost:       env("ZORAIL_RELAY_HOST", ""),
+		RelayPort:       int(envInt64("ZORAIL_RELAY_PORT", 587)),
+		RelayUser:       env("ZORAIL_RELAY_USER", ""),
+		RelayPass:       env("ZORAIL_RELAY_PASS", ""),
+		RelayFrom:       env("ZORAIL_RELAY_FROM", ""),
+		ForwardMaxTries: int(envInt64("ZORAIL_FORWARD_MAX_TRIES", 5)),
 		LogLevel:        env("ZORAIL_LOG_LEVEL", "info"),
 	}
 	if c.MaxMessageBytes <= 0 {

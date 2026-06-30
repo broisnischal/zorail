@@ -11,7 +11,7 @@ import (
 	gosmtp "github.com/emersion/go-smtp"
 
 	"github.com/nees/zorail/internal/config"
-	"github.com/nees/zorail/internal/storage"
+	"github.com/nees/zorail/internal/ingest"
 )
 
 // Server is the inbound SMTP server.
@@ -20,11 +20,11 @@ type Server struct {
 	log *slog.Logger
 }
 
-// New builds an SMTP server bound to cfg, persisting into store. Pass a non-nil
-// tlsConfig to enable STARTTLS; nil means plaintext only (fine behind a TLS
-// terminator or for local testing).
-func New(cfg *config.Config, store storage.Store, log *slog.Logger, tlsConfig *tls.Config) *Server {
-	be := &Backend{store: store, cfg: cfg, log: log}
+// New builds an SMTP server bound to cfg, handing received mail to ing. Pass a
+// non-nil tlsConfig to enable STARTTLS; nil means plaintext only (fine behind a
+// TLS terminator or for local testing).
+func New(cfg *config.Config, ing *ingest.Service, log *slog.Logger, tlsConfig *tls.Config) *Server {
+	be := &Backend{ing: ing, cfg: cfg, log: log}
 
 	s := gosmtp.NewServer(be)
 	s.Addr = cfg.SMTPAddr

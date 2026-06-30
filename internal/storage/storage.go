@@ -6,6 +6,7 @@ package storage
 
 import (
 	"context"
+	"time"
 
 	"github.com/nees/zorail/internal/model"
 )
@@ -37,6 +38,60 @@ type Store interface {
 	// DeleteInbox removes every message in an inbox and returns how many were
 	// deleted.
 	DeleteInbox(ctx context.Context, inbox string) (int64, error)
+
+	// --- Identity & API keys ---
+
+	// CreateUser persists a new user; returns ErrConflict if the email exists.
+	CreateUser(ctx context.Context, u *model.User) error
+	GetUserByEmail(ctx context.Context, email string) (*model.User, error)
+	GetUserByID(ctx context.Context, id string) (*model.User, error)
+	// CountUsers reports how many accounts exist (0 ⇒ instance needs setup).
+	CountUsers(ctx context.Context) (int, error)
+
+	// --- Instance settings (key/value) ---
+
+	// GetSetting returns a stored value, or "" (no error) when the key is unset.
+	GetSetting(ctx context.Context, key string) (string, error)
+	SetSetting(ctx context.Context, key, value string) error
+
+	// CreateAPIKey persists a key (only its hash). Secret is not stored.
+	CreateAPIKey(ctx context.Context, k *model.APIKey) error
+	// GetAPIKeyByHash resolves a presented key (already hashed) to its record.
+	GetAPIKeyByHash(ctx context.Context, hash string) (*model.APIKey, error)
+	ListAPIKeys(ctx context.Context, userID string) ([]*model.APIKey, error)
+	DeleteAPIKey(ctx context.Context, id, userID string) error
+
+	// --- Address registry ---
+
+	// UpsertAddress reserves or updates an address row.
+	UpsertAddress(ctx context.Context, a *model.Address) error
+	// GetAddress returns the registry row for a normalized address, or ErrNotFound.
+	GetAddress(ctx context.Context, address string) (*model.Address, error)
+	ListAddresses(ctx context.Context, userID string) ([]*model.Address, error)
+	DeleteAddress(ctx context.Context, address, userID string) error
+
+	// --- Forwarding ---
+
+	EnqueueForward(ctx context.Context, j *model.ForwardJob) error
+	// ClaimForwardJobs returns up to limit pending jobs whose next_attempt_at
+	// has passed, marking them in-flight to avoid double-send across workers.
+	ClaimForwardJobs(ctx context.Context, now time.Time, limit int) ([]*model.ForwardJob, error)
+	MarkForwardSent(ctx context.Context, id string) error
+	MarkForwardRetry(ctx context.Context, id string, attempts int, next time.Time, lastErr string) error
+	MarkForwardFailed(ctx context.Context, id, lastErr string) error
+
+	// --- Mailbox verification ---
+
+	CreateVerification(ctx context.Context, v *model.MailboxVerification) error
+	GetVerificationByToken(ctx context.Context, token string) (*model.MailboxVerification, error)
+	MarkVerified(ctx context.Context, dest string, when time.Time) error
+	IsVerified(ctx context.Context, dest string) (bool, error)
+
+	// --- Retention ---
+
+	// ExpireMessages deletes messages received before cutoff whose inbox is NOT
+	// a reserved/forward address, and returns how many were removed.
+	ExpireMessages(ctx context.Context, cutoff time.Time) (int64, error)
 
 	// Close releases underlying resources.
 	Close() error

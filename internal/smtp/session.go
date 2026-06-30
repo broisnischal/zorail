@@ -4,22 +4,21 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"strings"
 	"time"
 
 	gosmtp "github.com/emersion/go-smtp"
 
 	"github.com/nees/zorail/internal/config"
-	"github.com/nees/zorail/internal/id"
-	"github.com/nees/zorail/internal/mailparse"
-	"github.com/nees/zorail/internal/storage"
+	"github.com/nees/zorail/internal/ingest"
 )
 
-// Backend implements gosmtp.Backend, creating one Session per connection.
+// Backend implements gosmtp.Backend, creating one Session per connection. It
+// delegates all parse/store/side-effect work to the shared ingest service so
+// SMTP and HTTP ingest behave identically.
 type Backend struct {
-	store storage.Store
-	cfg   *config.Config
-	log   *slog.Logger
+	ing *ingest.Service
+	cfg *config.Config
+	log *slog.Logger
 }
 
 // NewSession is called once per inbound connection.
@@ -60,8 +59,8 @@ func (s *Session) Rcpt(to string, _ *gosmtp.RcptOptions) error {
 	return nil
 }
 
-// Data reads the message body, parses it once, and persists one copy per
-// recipient. The reader must be fully consumed before returning.
+// Data reads the message body and hands it to the ingest service, which parses
+// once and persists one copy per recipient.
 func (s *Session) Data(r io.Reader) error {
 	raw, err := io.ReadAll(r)
 	if err != nil {
@@ -69,33 +68,13 @@ func (s *Session) Data(r io.Reader) error {
 		return &gosmtp.SMTPError{Code: 451, Message: "Failed to read message"}
 	}
 
-	parsed, _ := mailparse.Parse(raw) // always returns a usable message
-	receivedAt := time.Now().UTC()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	for _, rcpt := range s.rcpts {
-		m := parsed.Clone()
-		m.ID = id.New()
-		m.Inbox = normalizeInbox(rcpt)
-		m.EnvFrom = s.from
-		m.ReceivedAt = receivedAt
-
-		if err := s.be.store.SaveMessage(ctx, m); err != nil {
-			s.be.log.Error("save message", "err", err, "inbox", m.Inbox, "remote", s.remote)
-			return &gosmtp.SMTPError{Code: 451, Message: "Failed to store message"}
-		}
-		s.be.log.Info("stored message",
-			"id", m.ID,
-			"inbox", m.Inbox,
-			"from", firstNonEmpty(m.From, m.EnvFrom),
-			"subject", m.Subject,
-			"size", m.Size,
-			"attachments", len(m.Attachments),
-		)
+	if _, err := s.be.ing.Accept(ctx, raw, s.from, s.rcpts); err != nil {
+		s.be.log.Error("ingest", "err", err, "remote", s.remote)
+		return &gosmtp.SMTPError{Code: 451, Message: "Failed to store message"}
 	}
-
 	return nil
 }
 
@@ -107,19 +86,3 @@ func (s *Session) Reset() {
 
 // Logout frees connection-scoped resources (none today).
 func (s *Session) Logout() error { return nil }
-
-// normalizeInbox lowercases the recipient address so inbox lookups are
-// case-insensitive, as is conventional for the domain part (and pragmatic for
-// the local part in a temp-mail context).
-func normalizeInbox(addr string) string {
-	return strings.ToLower(strings.TrimSpace(addr))
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}

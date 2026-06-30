@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nees/zorail/internal/config"
+	"github.com/nees/zorail/internal/ingest"
 	zsmtp "github.com/nees/zorail/internal/smtp"
 	"github.com/nees/zorail/internal/storage/sqlite"
 )
@@ -35,7 +36,8 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := zsmtp.New(cfg, store, log, nil)
+	ing := ingest.New(cfg, store, log, nil)
+	srv := zsmtp.New(cfg, ing, log, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

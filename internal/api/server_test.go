@@ -28,7 +28,7 @@ func newTestServer(t *testing.T, token string) (*httptest.Server, *sqlite.Store)
 
 	cfg := &config.Config{HTTPAddr: "127.0.0.1:0", APIToken: token}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv, err := api.New(cfg, store, log)
+	srv, err := api.New(cfg, store, log, nil)
 	if err != nil {
 		t.Fatalf("api.New: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestConfigSearchAndEnrichment(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 	cfg := &config.Config{HTTPAddr: "127.0.0.1:0", Domain: "localhost", AllowedDomains: []string{"mail.test"}}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv, _ := api.New(cfg, store, log)
+	srv, _ := api.New(cfg, store, log, nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 

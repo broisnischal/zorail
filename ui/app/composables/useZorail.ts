@@ -1,4 +1,5 @@
 import { reactive } from 'vue'
+import { toast as sonnerToast } from 'vue-sonner'
 
 export interface InboxSummary { inbox: string; message_count: number; last_received: string }
 export interface MsgMeta {
@@ -15,19 +16,36 @@ export interface FullMsg extends MsgMeta {
 export interface ServerConfig { version: string; domain: string; allowed_domains: string[]; auth_required: boolean }
 export interface Toast { id: number; msg: string; kind: 'ok' | 'err' }
 
+export interface User { id: string; email: string; created_at: string }
+export type Scope = 'read' | 'manage' | 'admin'
+export interface ApiKey {
+  id: string; user_id: string; name: string; scopes: Scope[]
+  inbox_prefix: string; created_at: string; last_used_at?: string
+  secret?: string // present only on the create response
+}
+export type AddressType = 'disposable' | 'reserved' | 'forward'
+export interface Address {
+  address: string; type: AddressType; owner_user_id?: string; expires_at?: string
+  forward_to?: string[]; forward_enabled: boolean; created_at: string
+}
+
 const LS = {
   token: 'zorail_token', theme: 'zorail_theme', accent: 'zorail_accent',
   images: 'zorail_images', read: 'zorail_read', pins: 'zorail_pins', auto: 'zorail_auto',
+  user: 'zorail_user',
 }
 
+// 'neutral' is the default and intentionally monochrome — it sets no
+// --accent-color, so the theme-aware CSS fallback (near-white on dark,
+// near-black on light) wins. The colored options are opt-in.
 const ACCENTS: Record<string, string> = {
+  neutral: '',
   sky: 'oklch(0.787 0.128 230.318)',
   emerald: 'oklch(0.792 0.153 166.95)',
   amber: 'oklch(0.828 0.165 84.429)',
   coral: 'oklch(0.704 0.177 14.75)',
   violet: 'oklch(0.78 0.148 286.067)',
   magenta: 'oklch(0.78 0.15 330)',
-  mono: 'oklch(0.92 0 0)',
 }
 
 const state = reactive({
@@ -41,19 +59,28 @@ const state = reactive({
   error: '',
   autoRefresh: true,
   theme: 'dark' as 'dark' | 'light',
-  accent: 'sky',
+  accent: 'neutral',
   loadImages: false,
   read: new Set<string>(),
   pins: new Set<string>(),
-  toasts: [] as Toast[],
   loadingInbox: false,
   loadingMsg: false,
   searchQuery: '',
   searching: false,
+  // multi-tenant
+  user: null as User | null,
+  keys: [] as ApiKey[],
+  addresses: [] as Address[],
+  loadingKeys: false,
+  loadingAddresses: false,
+  waiting: false,
+  // first-run setup
+  organization: '',
+  needsSetup: false,
+  setupChecked: false,
 })
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
-let toastSeq = 0
 const enc = encodeURIComponent
 
 function headers(): Record<string, string> {
@@ -71,9 +98,8 @@ async function guard(fn: () => Promise<void>) {
 }
 
 function toast(msg: string, kind: 'ok' | 'err' = 'ok') {
-  const id = ++toastSeq
-  state.toasts.push({ id, msg, kind })
-  setTimeout(() => { state.toasts = state.toasts.filter((t) => t.id !== id) }, 2600)
+  if (kind === 'err') sonnerToast.error(msg)
+  else sonnerToast.success(msg)
 }
 
 async function copy(v: string, note = 'copied') {
@@ -186,14 +212,24 @@ function applyTheme() {
   if (import.meta.client) document.documentElement.setAttribute('data-theme', state.theme)
 }
 function applyAccent() {
-  if (import.meta.client) document.documentElement.style.setProperty('--accent-color', ACCENTS[state.accent] || ACCENTS.sky!)
+  if (!import.meta.client) return
+  const v = ACCENTS[state.accent]
+  if (v) document.documentElement.style.setProperty('--accent-color', v)
+  else document.documentElement.style.removeProperty('--accent-color')
 }
 function setTheme(t: 'dark' | 'light') { state.theme = t; localStorage.setItem(LS.theme, t); applyTheme() }
 function setAccent(a: string) { state.accent = a; localStorage.setItem(LS.accent, a); applyAccent() }
 function setToken(t: string) { state.token = t.trim(); localStorage.setItem(LS.token, state.token); loadConfig(); loadInboxes() }
 function toggleImages() { state.loadImages = !state.loadImages; localStorage.setItem(LS.images, String(state.loadImages)) }
 function toggleAuto() { state.autoRefresh = !state.autoRefresh; localStorage.setItem(LS.auto, String(state.autoRefresh)); startPolling() }
-function accentList() { return Object.entries(ACCENTS).map(([k, v]) => ({ key: k, value: v })) }
+function accentList() {
+  // 'neutral' has no color of its own; show a swatch that reads as grayscale.
+  return Object.entries(ACCENTS).map(([k, v]) => ({
+    key: k,
+    value: v,
+    swatch: v || 'linear-gradient(135deg, oklch(0.97 0 0), oklch(0.45 0 0))',
+  }))
+}
 
 function persistSet(key: string, set: Set<string>) {
   if (import.meta.client) localStorage.setItem(key, JSON.stringify([...set]))
@@ -201,6 +237,139 @@ function persistSet(key: string, set: Set<string>) {
 function loadSet(key: string): Set<string> {
   if (!import.meta.client) return new Set()
   try { return new Set(JSON.parse(localStorage.getItem(key) || '[]')) } catch { return new Set() }
+}
+
+// ---- multi-tenant: auth, keys, addresses, forwarding ----
+
+// errMsg pulls the server's {error} message out of an ofetch failure.
+function errMsg(e: unknown, fallback = 'request failed'): string {
+  const err = e as { data?: { error?: string }; statusCode?: number; message?: string }
+  return err?.data?.error || err?.message || fallback
+}
+
+// ---- first-run setup ----
+async function loadSetup() {
+  try {
+    const s = await call<{ needs_setup: boolean; organization: string }>('/setup')
+    state.needsSetup = s.needs_setup
+    state.organization = s.organization || ''
+  } catch { /* leave defaults; dashboard still works in open mode */ }
+  finally { state.setupChecked = true }
+}
+
+async function setup(organization: string, email: string, password: string): Promise<void> {
+  const res = await call<{ user: User; token: string; organization: string }>('/setup', {
+    method: 'POST', body: { organization, email, password },
+  })
+  setUser(res.user)
+  state.token = res.token
+  state.organization = res.organization
+  state.needsSetup = false
+  if (import.meta.client) localStorage.setItem(LS.token, res.token)
+  await Promise.all([loadConfig(), loadInboxes()])
+}
+
+function setUser(u: User | null) {
+  state.user = u
+  if (import.meta.client) {
+    if (u) localStorage.setItem(LS.user, JSON.stringify(u))
+    else localStorage.removeItem(LS.user)
+  }
+}
+
+// register creates an account then logs in, so the caller ends up authenticated.
+async function register(email: string, password: string): Promise<void> {
+  await call<User>('/auth/register', { method: 'POST', body: { email, password } })
+  await login(email, password)
+}
+
+async function login(email: string, password: string): Promise<void> {
+  const res = await call<{ user: User; token: string }>('/auth/login', { method: 'POST', body: { email, password } })
+  setUser(res.user)
+  // The login token is a manage-scoped key; store it as the active bearer.
+  state.token = res.token
+  if (import.meta.client) localStorage.setItem(LS.token, res.token)
+  await Promise.all([loadConfig(), loadInboxes(), loadAddresses(), loadKeys()])
+}
+
+function logout() {
+  setUser(null)
+  state.token = ''
+  state.keys = []
+  state.addresses = []
+  if (import.meta.client) localStorage.removeItem(LS.token)
+  loadConfig(); loadInboxes()
+}
+
+const isAuthed = () => !!state.user
+
+// API keys
+async function loadKeys(): Promise<void> {
+  if (!state.user) { state.keys = []; return }
+  state.loadingKeys = true
+  try { state.keys = (await call<ApiKey[]>('/keys')) || [] }
+  catch { /* surfaced by the calling view if needed */ }
+  finally { state.loadingKeys = false }
+}
+async function createKey(name: string, scopes: Scope[], inboxPrefix: string): Promise<ApiKey> {
+  const k = await call<ApiKey>('/keys', { method: 'POST', body: { name, scopes, inbox_prefix: inboxPrefix } })
+  await loadKeys()
+  return k
+}
+async function deleteKey(id: string): Promise<void> {
+  await call(`/keys/${enc(id)}`, { method: 'DELETE' })
+  await loadKeys()
+}
+
+// Addresses (reserved / forwarding)
+async function loadAddresses(): Promise<void> {
+  if (!state.user) { state.addresses = []; return }
+  state.loadingAddresses = true
+  try { state.addresses = (await call<Address[]>('/addresses')) || [] }
+  catch { /* surfaced by the calling view if needed */ }
+  finally { state.loadingAddresses = false }
+}
+async function reserveAddress(body: { address?: string; prefix?: string; type: AddressType; forward_to?: string[] }): Promise<Address> {
+  const a = await call<Address>('/addresses', { method: 'POST', body })
+  await loadAddresses()
+  return a
+}
+async function updateAddress(address: string, patch: { forward_to?: string[]; forward_enabled?: boolean }): Promise<void> {
+  await call(`/addresses/${enc(address)}`, { method: 'PATCH', body: patch })
+  await loadAddresses()
+}
+async function releaseAddress(address: string): Promise<void> {
+  await call(`/addresses/${enc(address)}`, { method: 'DELETE' })
+  await loadAddresses()
+}
+
+// Mailbox verification for forwarding destinations.
+async function requestVerify(dest: string): Promise<{ dest: string; status: string; sent?: boolean; confirm_url?: string }> {
+  return await call('/verify/request', { method: 'POST', body: { dest } })
+}
+
+// Long-poll: block until the next message lands in `inbox`, then open it.
+async function waitForNext(inbox: string, timeoutSec = 25): Promise<boolean> {
+  if (!inbox || state.waiting) return false
+  state.waiting = true
+  const after = state.inbox === inbox && state.messages[0] ? state.messages[0].id : ''
+  try {
+    const m = await call<FullMsg | null>(`/inboxes/${enc(inbox)}/wait?timeout=${timeoutSec}&after=${enc(after)}`)
+    if (m && m.id) {
+      if (state.inbox !== inbox) await openInbox(inbox)
+      else await loadMessages()
+      await openMessage(m.id)
+      toast('new message arrived')
+      return true
+    }
+    toast('no new mail within ' + timeoutSec + 's')
+    return false
+  } catch (e) {
+    toast(errMsg(e, 'wait failed'), 'err')
+    return false
+  } finally {
+    state.waiting = false
+  }
 }
 
 // ---- polling ----
@@ -215,14 +384,16 @@ function init() {
   if (import.meta.client) {
     state.token = localStorage.getItem(LS.token) || ''
     state.theme = (localStorage.getItem(LS.theme) as 'dark' | 'light') || 'dark'
-    state.accent = localStorage.getItem(LS.accent) || 'sky'
+    state.accent = localStorage.getItem(LS.accent) || 'neutral'
     state.loadImages = localStorage.getItem(LS.images) === 'true'
     state.autoRefresh = localStorage.getItem(LS.auto) !== 'false'
     state.read = loadSet(LS.read)
     state.pins = loadSet(LS.pins)
+    try { state.user = JSON.parse(localStorage.getItem(LS.user) || 'null') } catch { state.user = null }
     applyTheme(); applyAccent()
   }
-  loadConfig(); loadInboxes(); startPolling()
+  loadSetup(); loadConfig(); loadInboxes(); startPolling()
+  if (state.user) { loadAddresses(); loadKeys() }
 }
 
 export function useZorail() {
@@ -233,5 +404,11 @@ export function useZorail() {
     markRead, isRead, inboxUnread, togglePin, isPinned, recentInboxes,
     setTheme, setAccent, setToken, toggleImages, toggleAuto, accentList,
     toast, copy, startPolling, stopPolling,
+    // multi-tenant
+    loadSetup, setup,
+    isAuthed, register, login, logout,
+    loadKeys, createKey, deleteKey,
+    loadAddresses, reserveAddress, updateAddress, releaseAddress, requestVerify,
+    waitForNext, errMsg,
   }
 }

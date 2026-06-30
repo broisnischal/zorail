@@ -74,6 +74,63 @@ CREATE TABLE IF NOT EXISTS attachments (
 	content      BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+
+CREATE TABLE IF NOT EXISTS users (
+	id            TEXT PRIMARY KEY,
+	email         TEXT NOT NULL UNIQUE,
+	password_hash TEXT NOT NULL,
+	created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+	id           TEXT PRIMARY KEY,
+	user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name         TEXT,
+	key_hash     TEXT NOT NULL UNIQUE,
+	scopes       TEXT NOT NULL DEFAULT 'read', -- CSV of scopes
+	inbox_prefix TEXT NOT NULL DEFAULT '',
+	created_at   INTEGER NOT NULL,
+	last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+
+CREATE TABLE IF NOT EXISTS addresses (
+	address         TEXT PRIMARY KEY,
+	type            TEXT NOT NULL,
+	owner_user_id   TEXT REFERENCES users(id) ON DELETE CASCADE,
+	expires_at      INTEGER,                  -- NULL = permanent
+	forward_to      TEXT NOT NULL DEFAULT '', -- CSV of destinations
+	forward_enabled INTEGER NOT NULL DEFAULT 0,
+	created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_addresses_owner ON addresses(owner_user_id);
+
+CREATE TABLE IF NOT EXISTS forward_jobs (
+	id              TEXT PRIMARY KEY,
+	message_id      TEXT,
+	src_address     TEXT NOT NULL,
+	dest            TEXT NOT NULL,
+	raw             BLOB,
+	attempts        INTEGER NOT NULL DEFAULT 0,
+	next_attempt_at INTEGER NOT NULL,
+	status          TEXT NOT NULL DEFAULT 'pending',
+	last_error      TEXT,
+	created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_forward_jobs_due ON forward_jobs(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS mailbox_verifications (
+	dest        TEXT PRIMARY KEY,
+	user_id     TEXT NOT NULL,
+	token       TEXT NOT NULL UNIQUE,
+	verified_at INTEGER,
+	created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)

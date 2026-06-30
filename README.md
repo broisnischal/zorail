@@ -8,12 +8,14 @@ and never lands in a public inbox anyone can read.
 Built for teams that test their own products: point your staging app's email at
 `anything@your-zorail-domain`, then read it back programmatically.
 
-> **Status: MVP — SMTP ingest + storage + JSON API + bundled web UI.** Zorail
-> accepts inbound mail, parses it (MIME, attachments, charsets, RFC 2047
-> headers), persists it to SQLite, and serves it through a JSON API and a
-> YOPmail-style web dashboard embedded directly in the binary. Scoped per-key
-> auth, server-side spam scoring, AI-powered extraction, and pluggable AI
-> providers are designed-for but not yet implemented — see [Roadmap](#roadmap).
+> **Status: multi-tenant — three address modes, scoped auth, MCP, forwarding.**
+> Zorail accepts inbound mail (SMTP or HTTP ingest), parses it (MIME,
+> attachments, charsets, RFC 2047 headers), persists it to SQLite, and serves it
+> through a JSON API, a YOPmail-style web dashboard, and an **MCP server** — all
+> embedded in one static binary. It now offers **disposable**, **reserved**, and
+> **forwarding** addresses; **user accounts with scoped API keys**; a long-poll /
+> MCP `wait_for_message`; and retention sweeping. Pluggable AI providers remain
+> designed-for but not yet implemented — see [Roadmap](#roadmap).
 
 ## Why
 
@@ -109,16 +111,67 @@ The JSON API under `/api`:
 | `GET /api/messages/{id}/attachments/{aid}`      | Download an attachment               |
 | `DELETE /api/messages/{id}`                     | Delete a message                     |
 | `DELETE /api/inboxes/{inbox}`                   | Clear an inbox                       |
+| `GET /api/inboxes/{inbox}/wait?timeout=&after=` | **Long-poll**: block until the next message arrives (204 on timeout) |
+| `POST /api/ingest`                              | Push mail in over HTTP (Cloudflare Worker / relay → Zorail) |
+| `POST /api/auth/register` · `/login`            | Create a user · log in (returns a `zk_` manage key) |
+| `GET·POST /api/keys` · `DELETE /api/keys/{id}`  | List / mint / revoke scoped API keys |
+| `GET·POST /api/addresses` · `PATCH·DELETE …/{address}` | Reserve / configure / release reserved & forwarding addresses |
+| `POST /api/verify/request` · `GET /api/verify/confirm` | Verify a forwarding destination mailbox |
 
-If `ZORAIL_API_TOKEN` is set, every `/api` call (except health) requires it via
-`Authorization: Bearer <token>` or `?token=<token>`. The UI has a ⚙ button to
-store the token in the browser.
+If `ZORAIL_API_TOKEN` is set, every `/api` call (except health/config) requires
+it via `Authorization: Bearer <token>` or `?token=<token>`. The UI has a ⚙
+button to store the token in the browser.
 
 Example — poll an inbox from a test suite:
 
 ```bash
 curl -s "http://localhost:8080/api/inboxes/qa-1%40your.domain/messages" \
   -H "Authorization: Bearer $ZORAIL_API_TOKEN"
+```
+
+## Three address modes
+
+Zorail serves three behaviors on one ingest engine (see [docs/PRD.md](docs/PRD.md)):
+
+- **Disposable** — catch-all, ephemeral, auto-expiring (set `ZORAIL_RETENTION_DAYS`). The default; no setup.
+- **Reserved** — a permanent address claimed by a user (`POST /api/addresses {type:"reserved"}`); never swept.
+- **Forwarding** — a reserved address that re-emits each message to a **verified** external mailbox (your Gmail/Outlook). `POST /api/addresses {type:"forward", forward_to:[…]}`, then verify the destination.
+
+### Users & scoped keys
+
+Replace the single global token with real accounts and **scoped API keys**:
+register → log in → mint keys with scopes (`read` / `manage` / `admin`) and an
+optional **inbox-prefix** so one Zorail safely serves many teams. The legacy
+`ZORAIL_API_TOKEN`, when set, is accepted as an implicit admin key.
+
+### Forwarding: how delivery works (and why it's delegated)
+
+Zorail **never runs raw outbound SMTP with its own IP reputation.** Forwarded
+mail is re-emitted **verbatim** (preserving the original DKIM signature) with the
+envelope sender rewritten to a Zorail-owned bounce address (**SRS-lite**, so SPF
+aligns). Two supported deployments:
+
+- **Cloudflare Email Routing (no infra):** Cloudflare is the MX and forwards
+  natively; an Email Worker also `POST`s each message to `/api/ingest` so Zorail
+  keeps a searchable copy. Leave `ZORAIL_RELAY_*` empty.
+- **Relay smarthost:** set `ZORAIL_RELAY_HOST` (Resend/Postmark/SES SMTP or any
+  submission server). The built-in forward worker delivers queued mail through
+  it with retry/backoff. Destinations must be verified first
+  (`/api/verify/request`).
+
+## MCP server (for AI agents)
+
+Zorail exposes a [Model Context Protocol](https://modelcontextprotocol.io) server
+(official Go SDK, Streamable HTTP) at **`/mcp`**, authenticated with the same
+`zk_` keys. Tools: `create_disposable_address`, `list_inboxes`, `list_messages`,
+`read_message`, `delete_message`, and **`wait_for_message`** — which *blocks*
+until the next mail arrives and returns the extracted OTP codes/links. That makes
+Zorail the email step in agentic end-to-end tests: mint an address → trigger the
+signup → `wait_for_message` → read the code.
+
+```jsonc
+// MCP endpoint:  POST http://localhost:8080/mcp
+// Header:        Authorization: Bearer zk_…
 ```
 
 ## Quick start
@@ -180,6 +233,11 @@ docker compose up --build -d
 Edit `docker-compose.yml` to set `ZORAIL_DOMAIN` and `ZORAIL_ALLOWED_DOMAINS`,
 then point your domain's MX record at the host running Zorail.
 
+For a full cloud walk-through — provisioning an EC2 instance, the exact
+Cloudflare DNS records (MX + the grey-cloud gotcha), HTTPS for the dashboard via
+Caddy, and a port-25-free path using a Cloudflare Email Worker → `/api/ingest` —
+see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
+
 ## Configuration
 
 All via environment variables:
@@ -194,6 +252,13 @@ All via environment variables:
 | `ZORAIL_HTTP_ADDR`         | `:8080`       | Listen address for the web UI + JSON API.              |
 | `ZORAIL_API_TOKEN`         | *(empty)*     | When set, `/api` requires this bearer token. Empty = open. |
 | `ZORAIL_DB_PATH`           | `zorail.db`   | SQLite file path.                                      |
+| `ZORAIL_RETENTION_DAYS`    | `0`           | Sweep disposable mail older than N days (0 = never). Reserved/forward addresses are exempt. |
+| `ZORAIL_RELAY_HOST`        | *(empty)*     | Outbound relay/smarthost for forwarding. Empty = forwarding delegated (e.g. to Cloudflare Email Routing). |
+| `ZORAIL_RELAY_PORT`        | `587`         | Relay port (587 STARTTLS submission).                  |
+| `ZORAIL_RELAY_USER`        | *(empty)*     | Relay username (empty = no auth).                      |
+| `ZORAIL_RELAY_PASS`        | *(empty)*     | Relay password.                                        |
+| `ZORAIL_RELAY_FROM`        | `bounces@<domain>` | Envelope `MAIL FROM` for forwards (SRS-lite, SPF alignment). |
+| `ZORAIL_FORWARD_MAX_TRIES` | `5`           | Give up forwarding after this many attempts.           |
 | `ZORAIL_LOG_LEVEL`         | `info`        | `debug` \| `info` \| `warn` \| `error`.               |
 
 ## Development
@@ -236,22 +301,35 @@ Done:
 - ✅ **Search** across all mail.
 - ✅ **Optional token auth** on the API/UI.
 - ✅ **GHCR publishing** — multi-arch image via GitHub Actions.
+- ✅ **Long-poll** — `GET …/wait` and the MCP `wait_for_message` tool block until
+  the next message arrives instead of busy-polling.
+- ✅ **User accounts + scoped API keys** — `read`/`manage`/`admin` scopes with
+  optional inbox-prefix scoping, so one Zorail serves a whole org safely.
+- ✅ **Reserved & forwarding addresses** — permanent claimed inboxes, and
+  forwarding to verified external mailboxes via a relay (or delegated to
+  Cloudflare Email Routing).
+- ✅ **HTTP ingest** (`POST /api/ingest`) — receive mail without opening port 25.
+- ✅ **MCP server** — agent-native tools over Streamable HTTP.
+- ✅ **Retention/TTL** — `ZORAIL_RETENTION_DAYS` sweeps disposable mail (reserved
+  & forwarding addresses exempt).
 
 Next, in priority order:
 
-1. **Long-poll / webhook** — "wait for the next mail in inbox X" so test suites
-   block instead of busy-polling.
-2. **Scoped API keys** — per-team / per-project keys with inbox-prefix scoping
-   and rate limits, so one Zorail serves a whole org safely.
-3. **Pluggable AI providers** — summarize and classify via the `internal/ai`
+1. **Pluggable AI providers** — summarize and classify via the `internal/ai`
    provider interface (Claude / Mistral / Ollama), selectable per deployment or
    per key, including a fully local/offline option for air-gapped self-hosting.
-4. **Retention/TTL** — auto-expire disposable inboxes after a configurable age.
+2. **Per-key rate limits** — the key table is ready; enforcement is deferred.
+3. **Reverse-alias replies** — reply from a forwarding alias (SimpleLogin-style),
+   and ARC sealing so a "forwarded by Zorail" banner won't break DMARC.
 
 ## Security notes
 
-- Zorail is **receive-only**; it never relays mail.
+- Disposable/reserved modes are **receive-only**. **Forwarding sends** — it is
+  delegated to a relay/Cloudflare and only delivers to **verified** destinations,
+  so Zorail is not an open relay.
 - Always set `ZORAIL_ALLOWED_DOMAINS` in production so you are not an open sink.
+- Set `ZORAIL_API_TOKEN` (admin) and/or use scoped `zk_` keys; keys are stored as
+  sha-256 hashes, passwords as bcrypt.
 - Run behind a firewall or TLS terminator; STARTTLS support is wired in
   (`smtp.New` accepts a `*tls.Config`) and will be exposed via config next.
 - The `internal/ai` seam means AI processing is opt-in and provider-selectable —

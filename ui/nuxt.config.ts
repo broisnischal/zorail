@@ -1,3 +1,5 @@
+import tailwindcss from '@tailwindcss/vite'
+
 // Zorail dashboard — a client-side SPA (ssr: false). `nuxt generate` emits a
 // static bundle to .output/public, which the Go server embeds and serves, so
 // the whole product still ships as one binary / one Docker image.
@@ -5,11 +7,16 @@ export default defineNuxtConfig({
   compatibilityDate: '2025-06-01',
   ssr: false,
   devtools: { enabled: false },
-  css: ['~/assets/css/main.css'],
+  css: ['~/assets/css/main.css', 'vue-sonner/style.css'],
+
+  // Tailwind v4 is wired through its Vite plugin (no PostCSS config needed);
+  // shadcn-nuxt auto-imports the generated UI components from ~/components/ui.
+  vite: { plugins: [tailwindcss()] },
 
   // Self-hosts fonts at build time (no runtime CDN), keeping the generated
   // output fully self-contained for air-gapped self-hosting.
-  modules: ['@nuxt/fonts'],
+  modules: ['@nuxt/fonts', 'shadcn-nuxt'],
+  shadcn: { prefix: '', componentDir: '~/components/ui' },
   fonts: {
     families: [
       { name: 'Geist', provider: 'google', weights: [400, 500, 600, 700] },

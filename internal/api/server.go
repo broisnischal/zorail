@@ -5,7 +5,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -18,12 +17,29 @@ import (
 
 	"github.com/nees/zorail/internal/config"
 	"github.com/nees/zorail/internal/extract"
+	"github.com/nees/zorail/internal/ingest"
 	"github.com/nees/zorail/internal/model"
+	"github.com/nees/zorail/internal/notify"
 	"github.com/nees/zorail/internal/storage"
 )
 
 // Version is the advertised server version, surfaced via /api/config.
-const Version = "0.2.0"
+const Version = "0.3.0"
+
+// Mailer sends an already-composed RFC 5322 message via a relay. The forwarding
+// relay satisfies this; it is used here to send mailbox-verification mail.
+type Mailer interface {
+	Send(ctx context.Context, from string, to []string, raw []byte) error
+}
+
+// Deps bundles optional collaborators wired in by main. All fields may be nil
+// (e.g. in tests), in which case the dependent routes degrade gracefully.
+type Deps struct {
+	Ingest *ingest.Service // powers POST /api/ingest
+	Hub    *notify.Hub     // powers long-poll /wait
+	Mailer Mailer          // sends verification mail
+	MCP    http.Handler    // mounted at /mcp when non-nil
+}
 
 // Server is the HTTP server for the API + UI.
 type Server struct {
@@ -31,25 +47,61 @@ type Server struct {
 	store storage.Store
 	cfg   *config.Config
 	log   *slog.Logger
+	deps  Deps
 }
 
-// New builds the HTTP server with all routes wired.
-func New(cfg *config.Config, store storage.Store, log *slog.Logger) (*Server, error) {
+// New builds the HTTP server with all routes wired. deps may be nil.
+func New(cfg *config.Config, store storage.Store, log *slog.Logger, deps *Deps) (*Server, error) {
 	s := &Server{store: store, cfg: cfg, log: log}
+	if deps != nil {
+		s.deps = *deps
+	}
 
 	mux := http.NewServeMux()
 
-	// JSON API (Go 1.22 method+pattern routing).
+	// Open endpoints.
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/config", s.handleConfig)
-	mux.HandleFunc("GET /api/search", s.auth(s.handleSearch))
-	mux.HandleFunc("GET /api/inboxes", s.auth(s.handleListInboxes))
-	mux.HandleFunc("GET /api/inboxes/{inbox}/messages", s.auth(s.handleListMessages))
-	mux.HandleFunc("DELETE /api/inboxes/{inbox}", s.auth(s.handleDeleteInbox))
-	mux.HandleFunc("GET /api/messages/{id}", s.auth(s.handleGetMessage))
-	mux.HandleFunc("GET /api/messages/{id}/raw", s.auth(s.handleGetRaw))
-	mux.HandleFunc("GET /api/messages/{id}/attachments/{aid}", s.auth(s.handleGetAttachment))
-	mux.HandleFunc("DELETE /api/messages/{id}", s.auth(s.handleDeleteMessage))
+
+	// First-run setup (admin + organization). Open until configured.
+	mux.HandleFunc("GET /api/setup", s.handleSetupStatus)
+	mux.HandleFunc("POST /api/setup", s.handleSetup)
+
+	// Identity.
+	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
+	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	mux.HandleFunc("GET /api/keys", s.authn(model.ScopeManage, s.handleListKeys))
+	mux.HandleFunc("POST /api/keys", s.authn(model.ScopeManage, s.handleCreateKey))
+	mux.HandleFunc("DELETE /api/keys/{id}", s.authn(model.ScopeManage, s.handleDeleteKey))
+
+	// Address registry.
+	mux.HandleFunc("GET /api/addresses", s.authn(model.ScopeManage, s.handleListAddresses))
+	mux.HandleFunc("POST /api/addresses", s.authn(model.ScopeManage, s.handleReserveAddress))
+	mux.HandleFunc("PATCH /api/addresses/{address}", s.authn(model.ScopeManage, s.handleUpdateAddress))
+	mux.HandleFunc("DELETE /api/addresses/{address}", s.authn(model.ScopeManage, s.handleReleaseAddress))
+
+	// Mailbox verification for forwarding destinations.
+	mux.HandleFunc("POST /api/verify/request", s.authn(model.ScopeManage, s.handleVerifyRequest))
+	mux.HandleFunc("GET /api/verify/confirm", s.handleVerifyConfirm)
+
+	// Ingest (Cloudflare Email Worker / relay → Zorail).
+	mux.HandleFunc("POST /api/ingest", s.authn(model.ScopeManage, s.handleIngest))
+
+	// Message reading (legacy-open when no token is configured).
+	mux.HandleFunc("GET /api/search", s.authRead(s.handleSearch))
+	mux.HandleFunc("GET /api/inboxes", s.authRead(s.handleListInboxes))
+	mux.HandleFunc("GET /api/inboxes/{inbox}/messages", s.authRead(s.handleListMessages))
+	mux.HandleFunc("GET /api/inboxes/{inbox}/wait", s.authRead(s.handleWait))
+	mux.HandleFunc("DELETE /api/inboxes/{inbox}", s.authRead(s.handleDeleteInbox))
+	mux.HandleFunc("GET /api/messages/{id}", s.authRead(s.handleGetMessage))
+	mux.HandleFunc("GET /api/messages/{id}/raw", s.authRead(s.handleGetRaw))
+	mux.HandleFunc("GET /api/messages/{id}/attachments/{aid}", s.authRead(s.handleGetAttachment))
+	mux.HandleFunc("DELETE /api/messages/{id}", s.authRead(s.handleDeleteMessage))
+
+	if s.deps.MCP != nil {
+		mux.Handle("/mcp", s.deps.MCP)
+		mux.Handle("/mcp/", s.deps.MCP)
+	}
 
 	// Bundled web UI (Nuxt SPA): everything not under /api/ is served from the
 	// embedded FS, with a fallback to index.html for client-side routes.
@@ -105,29 +157,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-// auth wraps a handler with optional bearer-token enforcement. When no token is
-// configured, the API is open (YOPmail-style); when one is set, requests must
-// present it via `Authorization: Bearer <token>` or `?token=`.
-func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.APIToken == "" {
-			next(w, r)
-			return
-		}
-		got := r.URL.Query().Get("token")
-		if got == "" {
-			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-				got = strings.TrimPrefix(h, "Bearer ")
-			}
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.APIToken)) != 1 {
-			writeError(w, http.StatusUnauthorized, "missing or invalid API token")
-			return
-		}
-		next(w, r)
-	}
-}
-
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC()})
 }
@@ -141,11 +170,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	} else if s.cfg.Domain != "" {
 		domain = s.cfg.Domain
 	}
+	org, _ := s.store.GetSetting(r.Context(), settingOrgName)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         Version,
 		"domain":          domain,
 		"allowed_domains": s.cfg.AllowedDomains,
 		"auth_required":   s.cfg.APIToken != "",
+		"organization":    org,
 	})
 }
 
@@ -174,6 +205,10 @@ func (s *Server) handleListInboxes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	inbox := normalize(r.PathValue("inbox"))
+	if !principalFrom(r.Context()).allows(inbox) {
+		writeError(w, http.StatusForbidden, "inbox outside key scope")
+		return
+	}
 	limit := atoiDefault(r.URL.Query().Get("limit"), 100)
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
 
@@ -212,6 +247,10 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		s.serverError(w, "get message", err)
+		return
+	}
+	if !principalFrom(r.Context()).allows(m.Inbox) {
+		writeError(w, http.StatusForbidden, "message outside key scope")
 		return
 	}
 	// Enrich with server-computed signals so every consumer sees the same
@@ -280,7 +319,12 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteInbox(w http.ResponseWriter, r *http.Request) {
-	n, err := s.store.DeleteInbox(r.Context(), normalize(r.PathValue("inbox")))
+	inbox := normalize(r.PathValue("inbox"))
+	if !principalFrom(r.Context()).allows(inbox) {
+		writeError(w, http.StatusForbidden, "inbox outside key scope")
+		return
+	}
+	n, err := s.store.DeleteInbox(r.Context(), inbox)
 	if err != nil {
 		s.serverError(w, "delete inbox", err)
 		return
