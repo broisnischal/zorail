@@ -58,6 +58,7 @@ type Model struct {
 	showHelp bool
 	ready    bool
 	quitting bool
+	mouseOn  bool // when true the app captures mouse (click+wheel); m toggles it
 }
 
 // New builds the initial model.
@@ -73,12 +74,16 @@ func New(c *Client) Model {
 	vp.KeyMap.Up.SetKeys("up", "k")
 
 	return Model{
-		c:      c,
-		th:     newTheme(),
-		read:   map[string]bool{},
-		search: ti,
-		reader: vp,
-		focus:  focusInboxes,
+		c:       c,
+		th:      newTheme(),
+		read:    map[string]bool{},
+		search:  ti,
+		reader:  vp,
+		focus:   focusInboxes,
+		mouseOn: false, // start off so native drag-select/copy works; `m` enables it
+		// A gentle first-run hint that both modes exist.
+		status:   "drag to select & copy · press m for click + wheel-scroll",
+		statusOK: true,
 	}
 }
 
@@ -200,6 +205,56 @@ func (m Model) deleteMsgCmd(id string) tea.Cmd {
 			return errMsg{err}
 		}
 		return statusMsg{"message deleted", true}
+	}
+}
+
+// currentLinks returns the open message's links, repaired and deduped in the
+// same order the reader displays them, so the on-screen numbering (1., 2., …)
+// matches the digit keys that open them.
+func (m Model) currentLinks() []string {
+	if m.current == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range m.current.Extracted.Links {
+		l = urlAmp.Replace(l)
+		if seen[l] {
+			continue
+		}
+		seen[l] = true
+		out = append(out, l)
+	}
+	return out
+}
+
+// openLinkCmd opens a URL in the user's default browser.
+func (m Model) openLinkCmd(url string) tea.Cmd {
+	return func() tea.Msg {
+		if err := openURL(url); err != nil {
+			return statusMsg{"couldn't open link: " + err.Error(), false}
+		}
+		return statusMsg{"opened " + shortLink(url, 48), true}
+	}
+}
+
+// openAttachmentCmd downloads an attachment and opens it in the OS default app.
+func (m Model) openAttachmentCmd(msgID string, a Attachment) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		b, err := m.c.Attachment(ctx, msgID, a.ID)
+		if err != nil {
+			return statusMsg{"download failed: " + err.Error(), false}
+		}
+		path, err := saveTemp(a.Filename, b)
+		if err != nil {
+			return statusMsg{"save failed: " + err.Error(), false}
+		}
+		if err := openURL(path); err != nil {
+			return statusMsg{"saved to " + path + " (open failed)", false}
+		}
+		return statusMsg{"opened " + firstNonEmpty(a.Filename, "attachment"), true}
 	}
 }
 

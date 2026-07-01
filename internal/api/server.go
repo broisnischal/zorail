@@ -26,7 +26,7 @@ import (
 // Version is the advertised server version, surfaced via /api/config. It is a
 // var (not const) so release builds can stamp the tag via
 // -ldflags "-X github.com/nees/zorail/internal/api.Version=…".
-var Version = "0.4.0"
+var Version = "0.4.1"
 
 // Mailer sends an already-composed RFC 5322 message via a relay. The forwarding
 // relay satisfies this; it is used here to send mailbox-verification mail.

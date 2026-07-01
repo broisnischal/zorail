@@ -159,6 +159,28 @@ func (c *Client) Message(ctx context.Context, id string) (*FullMsg, error) {
 	return &m, nil
 }
 
+// Attachment downloads one attachment's bytes (authenticated), for opening in
+// the OS's default viewer.
+func (c *Client) Attachment(ctx context.Context, msgID, attID string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.base+"/api/messages/"+url.PathEscape(msgID)+"/attachments/"+url.PathEscape(attID), nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	res, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		return nil, fmt.Errorf("attachment: %s", res.Status)
+	}
+	return io.ReadAll(io.LimitReader(res.Body, 64<<20)) // 64 MiB cap
+}
+
 func (c *Client) Search(ctx context.Context, q string) ([]MsgMeta, error) {
 	var out []MsgMeta
 	err := c.do(ctx, http.MethodGet, "/api/search?q="+url.QueryEscape(q)+"&limit=200", &out)

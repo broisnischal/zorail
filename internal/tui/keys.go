@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"strings"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -29,6 +31,18 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.showHelp = !m.showHelp
 		return m, nil
+	case "m":
+		// Toggle mouse capture. Off → the terminal's own drag-to-select and copy
+		// work again; on → click and wheel-scroll work in the app. Can't have both
+		// at once (a terminal limitation), so this is the switch between them.
+		if m.mouseOn {
+			m.mouseOn = false
+			m.status, m.statusOK = "mouse off — drag to select & copy · press m to re-enable click/scroll", true
+			return m, tea.DisableMouse
+		}
+		m.mouseOn = true
+		m.status, m.statusOK = "mouse on — click to select · wheel to scroll", true
+		return m, tea.EnableMouseCellMotion
 	case "r":
 		var cmds []tea.Cmd
 		cmds = append(cmds, m.fetchInboxes())
@@ -201,6 +215,45 @@ func (m Model) onReaderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusMessages
 			return m, m.deleteMsgCmd(id)
 		}
+		return m, nil
+	case "o":
+		// Open the first (or only) link in the browser.
+		if links := m.currentLinks(); len(links) > 0 {
+			return m, m.openLinkCmd(links[0])
+		}
+		m.status, m.statusOK = "no links in this message", false
+		return m, nil
+	case "a":
+		// Open the first attachment in the OS default app.
+		if m.current != nil && len(m.current.Attachments) > 0 {
+			return m, m.openAttachmentCmd(m.current.ID, m.current.Attachments[0])
+		}
+		m.status, m.statusOK = "no attachments", false
+		return m, nil
+	case "p":
+		// Copy the whole message body to the clipboard — reliable copy without
+		// needing to drag-select.
+		if m.current != nil {
+			body := m.current.Text
+			if strings.TrimSpace(body) == "" && m.current.HTML != "" {
+				body = htmlToText(m.current.HTML)
+			}
+			if copyToClipboard(strings.TrimSpace(body)) {
+				m.status, m.statusOK = "message body copied", true
+			} else {
+				m.status, m.statusOK = "copy failed", false
+			}
+		}
+		return m, nil
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		// Open the Nth link.
+		n := int(msg.String()[0] - '0')
+		links := m.currentLinks()
+		if n <= len(links) {
+			return m, m.openLinkCmd(links[n-1])
+		}
+		m.status, m.statusOK = "no link "+msg.String(), false
+		return m, nil
 	}
 	// Everything else (up/down/pgup/pgdn/u/d-scroll) drives the reader scroll.
 	var cmd tea.Cmd

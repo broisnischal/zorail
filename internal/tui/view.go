@@ -231,20 +231,27 @@ func (m Model) renderMessage(w int) string {
 		}
 		b.WriteString("\n")
 	}
-	if len(msg.Extracted.Links) > 0 {
-		b.WriteString("\n" + th.colTitle.Render("LINKS") + "\n")
-		seen := map[string]bool{}
-		for _, l := range msg.Extracted.Links {
-			l = urlAmp.Replace(l) // repair &amp; in links cached before the extractor fix
-			if seen[l] {
-				continue // dedupe by full URL, not host, so distinct links survive
+	if links := m.currentLinks(); len(links) > 0 {
+		b.WriteString("\n" + th.colTitle.Render("LINKS") + th.faint.Render("  press 1-9 or o to open") + "\n")
+		for i, l := range links {
+			// Numbered, clickable OSC 8 hyperlink. The number matches the digit
+			// key that opens it; the link is also click-to-open in modern
+			// terminals. Visible label is a readable, truncated form.
+			num := th.metaKey.Render(fmt.Sprintf("%d.", i+1))
+			label := th.link.Render(shortLink(l, max(24, min(w-4, 72))))
+			b.WriteString(num + " " + osc8(l, label) + "\n")
+			if i >= 8 {
+				break // only 1-9 are keyable
 			}
-			seen[l] = true
-			// Clickable OSC 8 hyperlink to the full URL; visible label is a
-			// readable, truncated form on its own line so each link is separately
-			// clickable.
-			label := th.link.Render(shortLink(l, max(24, min(w, 72))))
-			b.WriteString(osc8(l, label) + "\n")
+		}
+	}
+
+	if len(msg.Attachments) > 0 {
+		b.WriteString("\n" + th.colTitle.Render("ATTACHMENTS") + th.faint.Render("  press a to open") + "\n")
+		for _, a := range msg.Attachments {
+			name := firstNonEmpty(a.Filename, "(unnamed)")
+			b.WriteString(th.metaKey.Render("• ") + wrap.Foreground(th.fg).Render(name) +
+				th.faint.Render("  "+a.ContentType+" · "+fmtSize(a.Size)) + "\n")
 		}
 	}
 
@@ -302,7 +309,16 @@ func (m Model) contextHints() string {
 	case focusMessages:
 		parts = []string{h("j/k", "move"), h("↵", "read"), h("d", "del"), h("←", "back")}
 	case focusReader:
-		parts = []string{h("c", "code"), h("y", "sender"), h("d", "del"), h("←", "back")}
+		parts = []string{h("1-9/o", "link"), h("c", "code"), h("p", "copy body")}
+		if m.current != nil && len(m.current.Attachments) > 0 {
+			parts = append(parts, h("a", "attach"))
+		}
+		parts = append(parts, h("d", "del"), h("←", "back"))
+		// Scroll position, so it's obvious the body scrolls.
+		if m.current != nil && !(m.reader.AtTop() && m.reader.AtBottom()) {
+			pct := int(m.reader.ScrollPercent() * 100)
+			parts = append([]string{th.faint.Render(fmt.Sprintf("↕ %d%%", pct))}, parts...)
+		}
 	}
 	parts = append(parts, h("?", "help"))
 	return strings.Join(parts, th.help.Render("   "))
@@ -311,9 +327,11 @@ func (m Model) contextHints() string {
 func (m Model) helpText() string {
 	th := m.th
 	rows := []string{
-		th.kbd("tab", "switch pane") + "   " + th.kbd("j/k ↑/↓", "move") + "   " + th.kbd("↵", "open / drill in") + "   " + th.kbd("← esc", "back"),
-		th.kbd("g", "generate address") + "   " + th.kbd("y", "copy address/sender") + "   " + th.kbd("c", "copy code") + "   " + th.kbd("/", "search"),
-		th.kbd("d/x", "delete message") + "   " + th.kbd("D", "clear inbox") + "   " + th.kbd("r", "refresh") + "   " + th.kbd("?", "close help") + "   " + th.kbd("q", "quit"),
+		th.kbd("tab", "switch pane") + "   " + th.kbd("j/k ↑/↓ · wheel", "move / scroll") + "   " + th.kbd("↵", "open / drill in") + "   " + th.kbd("← esc", "back"),
+		th.kbd("1-9 / o", "open link") + "   " + th.kbd("a", "open attachment") + "   " + th.kbd("c", "copy code") + "   " + th.kbd("p", "copy body") + "   " + th.kbd("y", "copy sender"),
+		th.kbd("m", "mouse ⇄ text-select") + "   " + th.faint.Render("(off = drag to select & copy · on = click + wheel-scroll)"),
+		th.kbd("g", "generate address") + "   " + th.kbd("/", "search") + "   " + th.kbd("d/x", "delete") + "   " + th.kbd("D", "clear inbox"),
+		th.kbd("r", "refresh") + "   " + th.kbd("?", "close help") + "   " + th.kbd("q", "quit"),
 	}
 	return strings.Join(rows, "\n")
 }

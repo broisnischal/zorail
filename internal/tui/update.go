@@ -18,6 +18,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.onKey(msg)
 
+	case tea.MouseMsg:
+		return m.onMouse(msg)
+
 	case configMsg:
 		m.cfg = Config(msg)
 		return m, nil

@@ -94,6 +94,9 @@ func runTUI(args []string) int {
 	_ = fs.Parse(args)
 
 	client := tui.NewClient(*url, *token)
+	// Start WITHOUT capturing the mouse, so the terminal's own drag-to-select and
+	// copy work out of the box. The `m` key toggles mouse capture on for
+	// click-to-open + wheel-scroll when the user wants it.
 	p := tea.NewProgram(tui.New(client), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "zorail watch:", err)
