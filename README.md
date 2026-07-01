@@ -191,7 +191,7 @@ curl -fsSL https://raw.githubusercontent.com/broisnischal/zorail/main/scripts/in
 Pin a version or install dir with env vars:
 
 ```bash
-ZORAIL_VERSION=v0.3.0 ZORAIL_BIN_DIR="$HOME/.local/bin" \
+ZORAIL_VERSION=v0.4.0 ZORAIL_BIN_DIR="$HOME/.local/bin" \
   bash -c "$(curl -fsSL https://raw.githubusercontent.com/broisnischal/zorail/main/scripts/install-cli.sh)"
 ```
 
@@ -200,7 +200,7 @@ ZORAIL_VERSION=v0.3.0 ZORAIL_BIN_DIR="$HOME/.local/bin" \
 
 ```bash
 # macOS (Apple Silicon) example
-tar -xzf zorail_v0.3.0_darwin_arm64.tar.gz
+tar -xzf zorail_v0.4.0_darwin_arm64.tar.gz
 sudo install -m 0755 zorail /usr/local/bin/zorail
 ```
 
@@ -208,7 +208,7 @@ sudo install -m 0755 zorail /usr/local/bin/zorail
 extract `zorail.exe`, and put it somewhere on your `PATH` (e.g. via PowerShell):
 
 ```powershell
-Expand-Archive zorail_v0.3.0_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\zorail"
+Expand-Archive zorail_v0.4.0_windows_amd64.zip -DestinationPath "$env:LOCALAPPDATA\zorail"
 $env:Path += ";$env:LOCALAPPDATA\zorail"   # add permanently in System → Environment Variables
 ```
 

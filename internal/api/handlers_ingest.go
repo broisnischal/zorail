@@ -119,14 +119,11 @@ func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
 // newestAfter returns the newest fully-populated message in inbox whose ID
 // sorts after `after` (ULID-style IDs are time-ordered), or nil.
 func (s *Server) newestAfter(r *http.Request, inbox, after string) *model.Message {
-	msgs, err := s.store.ListMessages(r.Context(), inbox, 1, 0)
-	if err != nil || len(msgs) == 0 {
+	id, err := s.store.LatestMessageID(r.Context(), inbox, after)
+	if err != nil || id == "" {
 		return nil
 	}
-	if after != "" && msgs[0].ID <= after {
-		return nil
-	}
-	full, err := s.store.GetMessage(r.Context(), msgs[0].ID)
+	full, err := s.store.GetMessage(r.Context(), id)
 	if errors.Is(err, storage.ErrNotFound) || err != nil {
 		return nil
 	}

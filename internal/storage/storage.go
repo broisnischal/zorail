@@ -28,9 +28,22 @@ type Store interface {
 	// subject, sender, or body, newest first. Metadata only (no bodies/raw).
 	SearchMessages(ctx context.Context, q string, limit int) ([]*model.Message, error)
 
-	// GetMessage returns a single fully-populated message (bodies + attachment
-	// metadata) by ID, or ErrNotFound.
+	// GetMessage returns a message's bodies, headers, and attachment metadata by
+	// ID, or ErrNotFound. Raw source and attachment content are NOT loaded (they
+	// are large BLOBs fetched lazily via GetRaw / GetAttachment).
 	GetMessage(ctx context.Context, id string) (*model.Message, error)
+
+	// GetRaw returns the verbatim RFC 5322 source for a message, or ErrNotFound.
+	GetRaw(ctx context.Context, id string) ([]byte, error)
+
+	// GetAttachment returns a single attachment (including content) by message
+	// and attachment id, or ErrNotFound.
+	GetAttachment(ctx context.Context, msgID, attID string) (*model.Attachment, error)
+
+	// LatestMessageID returns the newest message id in inbox, or "" when the
+	// inbox is empty or its newest id does not sort strictly after `after`. Reads
+	// only the id, so long-poll waiters can cheaply detect a new arrival.
+	LatestMessageID(ctx context.Context, inbox, after string) (string, error)
 
 	// DeleteMessage removes a message and its attachments.
 	DeleteMessage(ctx context.Context, id string) error

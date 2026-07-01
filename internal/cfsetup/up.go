@@ -58,8 +58,20 @@ func Up(ctx context.Context, o Options) error {
 	// it (starting a second would fail with "address already in use"); only run
 	// the tunnel. Otherwise start our own server too.
 	httpAddr := firstNonEmpty(readEnvValue(o.EnvFile, "ZORAIL_HTTP_ADDR"), ":8090")
-	if serverResponding("http://" + localProbeHost(httpAddr) + "/api/config") {
+	localBase := "http://" + localProbeHost(httpAddr)
+	if serverResponding(localBase + "/api/config") {
 		okf("server already running on %s — starting tunnel only", httpAddr)
+		// Guard: reusing an already-running server is convenient, but if that
+		// server is in OPEN mode while .env defines a token, we are about to
+		// expose an UNAUTHENTICATED /api/ingest through the public tunnel. That
+		// is exactly the "doctor: server in OPEN mode" trap — warn with the fix.
+		if readEnvValue(o.EnvFile, "ZORAIL_API_TOKEN") != "" {
+			if cfg, cerr := newZorail(localBase, "").config(ctx); cerr == nil && !cfg.AuthRequired {
+				warnf("the running server on %s is UNPROTECTED (open mode), but %s sets a token.", httpAddr, o.EnvFile)
+				warnf("stop it (%s) and re-run `zorail up` so the server starts with the token —", cmd("lsof -ti tcp"+httpAddr+" | xargs -r kill"))
+				warnf("otherwise the public tunnel exposes an unauthenticated /api/ingest endpoint.")
+			}
+		}
 	} else {
 		srv := serverCmd(runCtx, repoRoot)
 		srv.Stdout, srv.Stderr = prefixWriter("server", os.Stdout), prefixWriter("server", os.Stderr)

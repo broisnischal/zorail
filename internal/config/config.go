@@ -29,6 +29,12 @@ type Config struct {
 	HTTPAddr string // host:port for the JSON API and bundled web UI
 	APIToken string // optional bearer token; when set, /api requires it
 
+	// Per-client rate limiting for /api (token bucket keyed by API key or IP).
+	// RateLimitRPS <= 0 disables limiting entirely.
+	RateLimitRPS   float64 // sustained requests/sec per client
+	RateLimitBurst int     // bucket size (max burst)
+	TrustProxy     bool    // when true, honor X-Forwarded-For for the client IP
+
 	// Storage.
 	DBPath string // path to the SQLite database file
 
@@ -80,6 +86,9 @@ func Load() (*Config, error) {
 		AllowedDomains:  normalizeDomains(envList("ZORAIL_ALLOWED_DOMAINS")),
 		HTTPAddr:        env("ZORAIL_HTTP_ADDR", ":8080"),
 		APIToken:        env("ZORAIL_API_TOKEN", ""),
+		RateLimitRPS:    envFloat("ZORAIL_RATE_LIMIT_RPS", 20),
+		RateLimitBurst:  int(envInt64("ZORAIL_RATE_LIMIT_BURST", 40)),
+		TrustProxy:      env("ZORAIL_TRUST_PROXY", "") == "true",
 		DBPath:          env("ZORAIL_DB_PATH", "zorail.db"),
 		RetentionDays:   int(envInt64("ZORAIL_RETENTION_DAYS", 0)),
 		RelayHost:       env("ZORAIL_RELAY_HOST", ""),
@@ -159,6 +168,15 @@ func envInt64(key string, def int64) int64 {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

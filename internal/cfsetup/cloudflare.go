@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -107,15 +108,50 @@ func truncate(s string, n int) string {
 
 // ---- token / account / zone ----
 
+// ErrAccountOwnedToken signals that the supplied token is a valid *account-owned*
+// Cloudflare token. Those cannot complete setup: Cloudflare's Tunnel API rejects
+// them with "Authentication error (10000)". Callers should tell the user to
+// create a user-owned token instead. Detecting this here — rather than letting
+// tunnel creation fail cryptically several steps later — keeps setup honest.
+var ErrAccountOwnedToken = errors.New("cloudflare token is account-owned")
+
+// VerifyToken confirms the API token is a usable user-owned token before setup
+// does real work. A user-owned token verifies at /user/tokens/verify and works
+// across every endpoint setup uses. If that check fails, VerifyToken figures out
+// whether the token is a valid-but-unusable account-owned token (returns
+// ErrAccountOwnedToken) or simply invalid (returns a copy-check hint).
 func (c *CF) VerifyToken(ctx context.Context) error {
+	status, err := c.verifyAt(ctx, "/user/tokens/verify")
+	if err == nil {
+		return checkStatus(status)
+	}
+
+	// The user endpoint rejected it. Determine which failure this is by probing
+	// the account-scoped verify (an account-owned token passes there): discover
+	// the account from a visible zone (the token carries Zone:Read).
+	if zones, zerr := c.ListZones(ctx); zerr == nil && len(zones) > 0 && zones[0].Account.ID != "" {
+		if st, aerr := c.verifyAt(ctx, "/accounts/"+zones[0].Account.ID+"/tokens/verify"); aerr == nil && st == "active" {
+			return ErrAccountOwnedToken
+		}
+	}
+	return fmt.Errorf("could not verify the Cloudflare API token — check it was copied in full "+
+		"(no leading/trailing characters) and has the listed permissions. Underlying error: %w", err)
+}
+
+// verifyAt calls a *tokens/verify endpoint and returns the reported status.
+func (c *CF) verifyAt(ctx context.Context, path string) (string, error) {
 	var r struct {
 		Status string `json:"status"`
 	}
-	if err := c.call(ctx, http.MethodGet, "/user/tokens/verify", nil, &r); err != nil {
-		return err
+	if err := c.call(ctx, http.MethodGet, path, nil, &r); err != nil {
+		return "", err
 	}
-	if r.Status != "active" {
-		return fmt.Errorf("API token status is %q (expected active)", r.Status)
+	return r.Status, nil
+}
+
+func checkStatus(status string) error {
+	if status != "active" {
+		return fmt.Errorf("API token status is %q (expected active)", status)
 	}
 	return nil
 }
@@ -127,6 +163,45 @@ type Zone struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"account"`
+}
+
+// Probe performs a minimal read against an endpoint to test whether the token
+// is authorized for it. nil means authorized; a non-nil error (typically an
+// authorization failure) means it is not. Used by setup's permission preflight.
+func (c *CF) Probe(ctx context.Context, path string) error {
+	return c.call(ctx, http.MethodGet, path, nil, nil)
+}
+
+// Account is a Cloudflare account the token can access.
+type Account struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// AccessibleAccounts lists the accounts this token can act on. An empty result
+// (with no error) means the token's Account Resources scope is empty or excludes
+// the account you're targeting — the usual cause of "Authentication error 10000"
+// on account-level endpoints even when zone reads work.
+func (c *CF) AccessibleAccounts(ctx context.Context) ([]Account, error) {
+	var accts []Account
+	err := c.call(ctx, http.MethodGet, "/accounts?per_page=50", nil, &accts)
+	return accts, err
+}
+
+// CanAccessAccount reports whether the token can act on accountID. The bool is
+// only meaningful when err is nil; a non-nil err means the check itself failed
+// (e.g. the token cannot even list accounts).
+func (c *CF) CanAccessAccount(ctx context.Context, accountID string) (bool, error) {
+	accts, err := c.AccessibleAccounts(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, a := range accts {
+		if a.ID == accountID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ListZones returns every zone the token can see, for interactive selection.

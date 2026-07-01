@@ -331,14 +331,11 @@ func (m *Manager) waitForMessage(c *caller) mcpsdk.ToolHandlerFor[waitIn, messag
 }
 
 func (m *Manager) newestAfter(ctx context.Context, inbox, after string) *model.Message {
-	msgs, err := m.store.ListMessages(ctx, inbox, 1, 0)
-	if err != nil || len(msgs) == 0 {
+	id, err := m.store.LatestMessageID(ctx, inbox, after)
+	if err != nil || id == "" {
 		return nil
 	}
-	if after != "" && msgs[0].ID <= after {
-		return nil
-	}
-	full, err := m.store.GetMessage(ctx, msgs[0].ID)
+	full, err := m.store.GetMessage(ctx, id)
 	if err != nil {
 		return nil
 	}

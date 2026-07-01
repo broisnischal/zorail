@@ -26,7 +26,7 @@ import (
 // Version is the advertised server version, surfaced via /api/config. It is a
 // var (not const) so release builds can stamp the tag via
 // -ldflags "-X github.com/nees/zorail/internal/api.Version=…".
-var Version = "0.3.0"
+var Version = "0.4.0"
 
 // Mailer sends an already-composed RFC 5322 message via a relay. The forwarding
 // relay satisfies this; it is used here to send mailbox-verification mail.
@@ -113,12 +113,20 @@ func New(cfg *config.Config, store storage.Store, log *slog.Logger, deps *Deps) 
 	}
 	mux.HandleFunc("/", spaHandler(sub))
 
+	var handler http.Handler = mux
+	if cfg.RateLimitRPS > 0 {
+		rl := newRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+		handler = rl.limitAPI(cfg.TrustProxy, handler)
+	}
+
 	s.srv = &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           logRequests(log, mux),
+		Handler:           logRequests(log, handler),
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// No WriteTimeout: the long-poll /wait endpoint legitimately holds a
+		// response open for up to 120s. Per-request deadlines are enforced via
+		// context instead.
+		IdleTimeout: 120 * time.Second,
 	}
 	return s, nil
 }
@@ -129,23 +137,35 @@ func (s *Server) Handler() http.Handler { return s.srv.Handler }
 // spaHandler serves static files from the embedded SPA bundle. Requests for
 // paths that don't map to a real file fall back to index.html, so client-side
 // routes (and a hard refresh on one) resolve correctly.
+//
+// The set of real files is enumerated once at startup (the bundle is immutable,
+// baked into the binary) so each request is a map lookup rather than an
+// open+stat syscall. Content-hashed assets under /_nuxt/ are served with a
+// long immutable cache; everything else is revalidated.
 func spaHandler(fsys fs.FS) http.HandlerFunc {
 	fileServer := http.FileServerFS(fsys)
+	files := make(map[string]struct{})
+	_ = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			files[p] = struct{}{}
+		}
+		return nil
+	})
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		// Serve a real, non-directory file (assets like /_nuxt/*, /favicon, …)
 		// directly. Everything else — including client-routed paths such as
 		// /addresses or /inbox/<addr> — is the SPA: hand back index.html at 200
 		// so the router takes over (no trailing-slash 301 round-trip).
-		if name != "" {
-			if f, err := fsys.Open(name); err == nil {
-				info, statErr := f.Stat()
-				_ = f.Close()
-				if statErr == nil && !info.IsDir() {
-					fileServer.ServeHTTP(w, r)
-					return
-				}
+		if _, ok := files[name]; ok {
+			if strings.HasPrefix(name, "_nuxt/") {
+				// Filenames are content-hashed → safe to cache forever.
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
 			}
+			fileServer.ServeHTTP(w, r)
+			return
 		}
 		serveIndex(fsys, w)
 	}
@@ -282,7 +302,11 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRaw(w http.ResponseWriter, r *http.Request) {
-	m, err := s.store.GetMessage(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	if !s.allowsMessage(w, r, id) {
+		return
+	}
+	raw, err := s.store.GetRaw(r.Context(), id)
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "message not found")
 		return
@@ -292,37 +316,55 @@ func (s *Server) handleGetRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write(m.Raw)
+	_, _ = w.Write(raw)
+}
+
+// allowsMessage enforces the caller's inbox-prefix scope on a message-id route
+// (raw/attachment downloads). It returns false and has already written the
+// response when access is denied or the message does not exist.
+func (s *Server) allowsMessage(w http.ResponseWriter, r *http.Request, id string) bool {
+	m, err := s.store.GetMessage(r.Context(), id)
+	if errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "message not found")
+		return false
+	}
+	if err != nil {
+		s.serverError(w, "get message", err)
+		return false
+	}
+	if !principalFrom(r.Context()).allows(m.Inbox) {
+		writeError(w, http.StatusForbidden, "message outside key scope")
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
-	m, err := s.store.GetMessage(r.Context(), r.PathValue("id"))
+	if !s.allowsMessage(w, r, r.PathValue("id")) {
+		return
+	}
+	a, err := s.store.GetAttachment(r.Context(), r.PathValue("id"), r.PathValue("aid"))
 	if errors.Is(err, storage.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "message not found")
+		writeError(w, http.StatusNotFound, "attachment not found")
 		return
 	}
 	if err != nil {
 		s.serverError(w, "get attachment", err)
 		return
 	}
-	aid := r.PathValue("aid")
-	for i := range m.Attachments {
-		a := &m.Attachments[i]
-		if a.ID == aid {
-			ct := a.ContentType
-			if ct == "" {
-				ct = "application/octet-stream"
-			}
-			w.Header().Set("Content-Type", ct)
-			w.Header().Set("Content-Disposition", "attachment; filename=\""+sanitizeFilename(a.Filename)+"\"")
-			_, _ = w.Write(a.Content)
-			return
-		}
+	ct := a.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
 	}
-	writeError(w, http.StatusNotFound, "attachment not found")
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+sanitizeFilename(a.Filename)+"\"")
+	_, _ = w.Write(a.Content)
 }
 
 func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	if !s.allowsMessage(w, r, r.PathValue("id")) {
+		return
+	}
 	err := s.store.DeleteMessage(r.Context(), r.PathValue("id"))
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "message not found")

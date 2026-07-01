@@ -37,7 +37,7 @@ func csvSplit(s string) []string {
 // --- Users ---
 
 func (s *Store) CreateUser(ctx context.Context, u *model.User) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.w.ExecContext(ctx,
 		`INSERT INTO users (id, email, password_hash, created_at) VALUES (?,?,?,?)`,
 		u.ID, strings.ToLower(u.Email), u.PasswordHash, u.CreatedAt.Unix())
 	if isUnique(err) {
@@ -61,18 +61,18 @@ func (s *Store) scanUser(row *sql.Row) (*model.User, error) {
 }
 
 func (s *Store) GetUserByEmail(ctx context.Context, email string) (*model.User, error) {
-	return s.scanUser(s.db.QueryRowContext(ctx,
+	return s.scanUser(s.r.QueryRowContext(ctx,
 		`SELECT id, email, password_hash, created_at FROM users WHERE email = ?`, strings.ToLower(email)))
 }
 
 func (s *Store) GetUserByID(ctx context.Context, id string) (*model.User, error) {
-	return s.scanUser(s.db.QueryRowContext(ctx,
+	return s.scanUser(s.r.QueryRowContext(ctx,
 		`SELECT id, email, password_hash, created_at FROM users WHERE id = ?`, id))
 }
 
 func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
+	err := s.r.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
 	return n, err
 }
 
@@ -80,7 +80,7 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 
 func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
 	var v string
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	err := s.r.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -88,7 +88,7 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
 }
 
 func (s *Store) SetSetting(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.w.ExecContext(ctx,
 		`INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		key, value)
 	return err
@@ -101,7 +101,7 @@ func (s *Store) CreateAPIKey(ctx context.Context, k *model.APIKey) error {
 	for i, sc := range k.Scopes {
 		scopes[i] = string(sc)
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.w.ExecContext(ctx,
 		`INSERT INTO api_keys (id, user_id, name, key_hash, scopes, inbox_prefix, created_at)
 		 VALUES (?,?,?,?,?,?,?)`,
 		k.ID, k.UserID, k.Name, k.KeyHash, csvJoin(scopes), k.InboxPrefix, k.CreatedAt.Unix())
@@ -132,7 +132,7 @@ func scanKey(sc func(...any) error) (*model.APIKey, error) {
 const keyCols = `id, user_id, name, key_hash, scopes, inbox_prefix, created_at, last_used_at`
 
 func (s *Store) GetAPIKeyByHash(ctx context.Context, hash string) (*model.APIKey, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+keyCols+` FROM api_keys WHERE key_hash = ?`, hash)
+	row := s.r.QueryRowContext(ctx, `SELECT `+keyCols+` FROM api_keys WHERE key_hash = ?`, hash)
 	k, err := scanKey(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storage.ErrNotFound
@@ -140,13 +140,21 @@ func (s *Store) GetAPIKeyByHash(ctx context.Context, hash string) (*model.APIKey
 	if err != nil {
 		return nil, err
 	}
-	// best-effort last_used bump; ignore failure
-	_, _ = s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE id = ?`, time.Now().Unix(), k.ID)
+	// Throttled last_used bump: only write when the stored value is stale, so a
+	// polling agent doesn't turn every authenticated read into a writer-pool
+	// write. Best-effort; failure is ignored.
+	now := time.Now()
+	if k.LastUsedAt.IsZero() || now.Sub(k.LastUsedAt) > lastUsedThrottle {
+		_, _ = s.w.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE id = ?`, now.Unix(), k.ID)
+	}
 	return k, nil
 }
 
+// lastUsedThrottle bounds how often api_keys.last_used_at is rewritten.
+const lastUsedThrottle = 60 * time.Second
+
 func (s *Store) ListAPIKeys(ctx context.Context, userID string) ([]*model.APIKey, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+keyCols+` FROM api_keys WHERE user_id = ? ORDER BY created_at DESC`, userID)
+	rows, err := s.r.QueryContext(ctx, `SELECT `+keyCols+` FROM api_keys WHERE user_id = ? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +171,7 @@ func (s *Store) ListAPIKeys(ctx context.Context, userID string) ([]*model.APIKey
 }
 
 func (s *Store) DeleteAPIKey(ctx context.Context, id, userID string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE id = ? AND user_id = ?`, id, userID)
+	res, err := s.w.ExecContext(ctx, `DELETE FROM api_keys WHERE id = ? AND user_id = ?`, id, userID)
 	if err != nil {
 		return err
 	}
@@ -184,7 +192,7 @@ func (s *Store) UpsertAddress(ctx context.Context, a *model.Address) error {
 	if a.ForwardEnabled {
 		fe = 1
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.w.ExecContext(ctx, `
 INSERT INTO addresses (address, type, owner_user_id, expires_at, forward_to, forward_enabled, created_at)
 VALUES (?,?,?,?,?,?,?)
 ON CONFLICT(address) DO UPDATE SET
@@ -222,7 +230,7 @@ func scanAddress(sc func(...any) error) (*model.Address, error) {
 const addrCols = `address, type, COALESCE(owner_user_id,''), expires_at, forward_to, forward_enabled, created_at`
 
 func (s *Store) GetAddress(ctx context.Context, address string) (*model.Address, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+addrCols+` FROM addresses WHERE address = ?`, strings.ToLower(address))
+	row := s.r.QueryRowContext(ctx, `SELECT `+addrCols+` FROM addresses WHERE address = ?`, strings.ToLower(address))
 	a, err := scanAddress(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storage.ErrNotFound
@@ -231,7 +239,7 @@ func (s *Store) GetAddress(ctx context.Context, address string) (*model.Address,
 }
 
 func (s *Store) ListAddresses(ctx context.Context, userID string) ([]*model.Address, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+addrCols+` FROM addresses WHERE owner_user_id = ? ORDER BY created_at DESC`, userID)
+	rows, err := s.r.QueryContext(ctx, `SELECT `+addrCols+` FROM addresses WHERE owner_user_id = ? ORDER BY created_at DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +256,7 @@ func (s *Store) ListAddresses(ctx context.Context, userID string) ([]*model.Addr
 }
 
 func (s *Store) DeleteAddress(ctx context.Context, address, userID string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM addresses WHERE address = ? AND owner_user_id = ?`, strings.ToLower(address), userID)
+	res, err := s.w.ExecContext(ctx, `DELETE FROM addresses WHERE address = ? AND owner_user_id = ?`, strings.ToLower(address), userID)
 	if err != nil {
 		return err
 	}
@@ -260,11 +268,15 @@ func (s *Store) DeleteAddress(ctx context.Context, address, userID string) error
 
 // --- Forwarding ---
 
+// EnqueueForward records a forward job. It does NOT copy the raw source: the
+// worker resolves it from the message (content-addressed blob) at send time via
+// GetRaw(message_id), so a message forwarded to several destinations stores its
+// bytes exactly once.
 func (s *Store) EnqueueForward(ctx context.Context, j *model.ForwardJob) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.w.ExecContext(ctx, `
 INSERT INTO forward_jobs (id, message_id, src_address, dest, raw, attempts, next_attempt_at, status, last_error, created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.MessageID, j.SrcAddress, j.Dest, j.Raw, j.Attempts,
+VALUES (?,?,?,?,NULL,?,?,?,?,?)`,
+		j.ID, j.MessageID, j.SrcAddress, j.Dest, j.Attempts,
 		j.NextAttemptAt.Unix(), string(j.Status), j.LastError, j.CreatedAt.Unix())
 	return err
 }
@@ -275,14 +287,14 @@ func (s *Store) ClaimForwardJobs(ctx context.Context, now time.Time, limit int) 
 	if limit <= 0 {
 		limit = 10
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, message_id, src_address, dest, raw, attempts, next_attempt_at, status, last_error, created_at
+SELECT id, message_id, src_address, dest, attempts, next_attempt_at, status, last_error, created_at
 FROM forward_jobs
 WHERE status = 'pending' AND next_attempt_at <= ?
 ORDER BY next_attempt_at ASC
@@ -296,7 +308,7 @@ LIMIT ?`, now.Unix(), limit)
 		var status string
 		var next, created int64
 		var lastErr sql.NullString
-		if err := rows.Scan(&j.ID, &j.MessageID, &j.SrcAddress, &j.Dest, &j.Raw, &j.Attempts, &next, &status, &lastErr, &created); err != nil {
+		if err := rows.Scan(&j.ID, &j.MessageID, &j.SrcAddress, &j.Dest, &j.Attempts, &next, &status, &lastErr, &created); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -328,18 +340,18 @@ LIMIT ?`, now.Unix(), limit)
 }
 
 func (s *Store) MarkForwardSent(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE forward_jobs SET status='sent', last_error='' WHERE id = ?`, id)
+	_, err := s.w.ExecContext(ctx, `UPDATE forward_jobs SET status='sent', last_error='' WHERE id = ?`, id)
 	return err
 }
 
 func (s *Store) MarkForwardRetry(ctx context.Context, id string, attempts int, next time.Time, lastErr string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE forward_jobs SET status='pending', attempts=?, next_attempt_at=?, last_error=? WHERE id = ?`,
+	_, err := s.w.ExecContext(ctx, `UPDATE forward_jobs SET status='pending', attempts=?, next_attempt_at=?, last_error=? WHERE id = ?`,
 		attempts, next.Unix(), lastErr, id)
 	return err
 }
 
 func (s *Store) MarkForwardFailed(ctx context.Context, id, lastErr string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE forward_jobs SET status='failed', last_error=? WHERE id = ?`, lastErr, id)
+	_, err := s.w.ExecContext(ctx, `UPDATE forward_jobs SET status='failed', last_error=? WHERE id = ?`, lastErr, id)
 	return err
 }
 
@@ -350,7 +362,7 @@ func (s *Store) CreateVerification(ctx context.Context, v *model.MailboxVerifica
 	if v.VerifiedAt != nil {
 		verified = v.VerifiedAt.Unix()
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.w.ExecContext(ctx, `
 INSERT INTO mailbox_verifications (dest, user_id, token, verified_at, created_at)
 VALUES (?,?,?,?,?)
 ON CONFLICT(dest) DO UPDATE SET token=excluded.token, verified_at=NULL, created_at=excluded.created_at`,
@@ -362,7 +374,7 @@ func (s *Store) GetVerificationByToken(ctx context.Context, token string) (*mode
 	v := &model.MailboxVerification{}
 	var verified sql.NullInt64
 	var created int64
-	err := s.db.QueryRowContext(ctx, `SELECT dest, user_id, token, verified_at, created_at FROM mailbox_verifications WHERE token = ?`, token).
+	err := s.r.QueryRowContext(ctx, `SELECT dest, user_id, token, verified_at, created_at FROM mailbox_verifications WHERE token = ?`, token).
 		Scan(&v.Dest, &v.UserID, &v.Token, &verified, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storage.ErrNotFound
@@ -379,7 +391,7 @@ func (s *Store) GetVerificationByToken(ctx context.Context, token string) (*mode
 }
 
 func (s *Store) MarkVerified(ctx context.Context, dest string, when time.Time) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE mailbox_verifications SET verified_at = ? WHERE dest = ?`, when.Unix(), strings.ToLower(dest))
+	res, err := s.w.ExecContext(ctx, `UPDATE mailbox_verifications SET verified_at = ? WHERE dest = ?`, when.Unix(), strings.ToLower(dest))
 	if err != nil {
 		return err
 	}
@@ -391,7 +403,7 @@ func (s *Store) MarkVerified(ctx context.Context, dest string, when time.Time) e
 
 func (s *Store) IsVerified(ctx context.Context, dest string) (bool, error) {
 	var verified sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT verified_at FROM mailbox_verifications WHERE dest = ?`, strings.ToLower(dest)).Scan(&verified)
+	err := s.r.QueryRowContext(ctx, `SELECT verified_at FROM mailbox_verifications WHERE dest = ?`, strings.ToLower(dest)).Scan(&verified)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -406,16 +418,21 @@ func (s *Store) IsVerified(ctx context.Context, dest string) (bool, error) {
 // ExpireMessages deletes messages older than cutoff whose inbox is not a
 // reserved/forward address (those are exempt from sweeping).
 func (s *Store) ExpireMessages(ctx context.Context, cutoff time.Time) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `
+	const notReserved = `
+	inbox NOT IN (SELECT address FROM addresses WHERE type IN ('reserved','forward'))`
+	res, err := s.w.ExecContext(ctx, `
 DELETE FROM messages
-WHERE received_at < ?
-  AND inbox NOT IN (
-		SELECT address FROM addresses WHERE type IN ('reserved','forward')
-  )`, cutoff.Unix())
+WHERE received_at < ? AND`+notReserved, cutoff.Unix())
 	if err != nil {
 		return 0, fmt.Errorf("expire messages: %w", err)
 	}
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		// Keep the FTS index and content-addressed blobs in step with the delete.
+		_, _ = s.w.ExecContext(ctx, `
+DELETE FROM messages_fts WHERE id NOT IN (SELECT id FROM messages)`)
+		s.gcRawBlobs(ctx)
+	}
 	return n, nil
 }
 

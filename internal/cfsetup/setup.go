@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -62,6 +63,14 @@ func Run(ctx context.Context, o Options) error {
 	cf := NewCF(o.CFToken)
 	step("Verifying Cloudflare token")
 	if err := cf.VerifyToken(ctx); err != nil {
+		if errors.Is(err, ErrAccountOwnedToken) {
+			warnf("that token is an %s API token, which Cloudflare's Tunnel API rejects.", bold("account-owned"))
+			fmt.Println("\n  Create a " + bold("user-owned") + " token instead (works with every step). The link below")
+			fmt.Println("  opens the right page with the permissions pre-selected:")
+			fmt.Println("  " + cmd(cfTokenTemplateURL()))
+			fmt.Println("\n  Then re-run " + bold("zorail setup") + " and paste the new token.")
+			return fmt.Errorf("account-owned token cannot be used for setup")
+		}
 		return err
 	}
 
@@ -92,13 +101,18 @@ func Run(ctx context.Context, o Options) error {
 		okf("zone %s (account %s)", zone.Name, firstNonEmpty(zone.Account.Name, zone.Account.ID))
 	}
 
+	// ---- 1b. verify the token can do EVERYTHING before we touch anything ----
+	if err := preflightPerms(ctx, cf, zone.Account.ID, zone.Account.Name, zone.ID); err != nil {
+		return err
+	}
+
 	// ---- 2. ensure the server requires auth (the tunnel makes ingest public) ----
 	step("Checking the local Zorail server")
-	z := newZorail(o.ServerURL, "")
-	cfg, err := z.config(ctx)
+	serverURL, cfg, err := resolveServer(ctx, o.ServerURL, o.EnvFile)
 	if err != nil {
-		return fmt.Errorf("cannot reach Zorail at %s: %w", o.ServerURL, err)
+		return err
 	}
+	o.ServerURL = serverURL // adopt whichever port actually answered
 	okf("reachable · domain %s · version %s", firstNonEmpty(cfg.Domain, "?"), firstNonEmpty(cfg.Version, "?"))
 
 	ingestToken, _, err := ensureServerToken(ctx, o, cfg.AuthRequired)
@@ -111,7 +125,7 @@ func Run(ctx context.Context, o Options) error {
 	step("Creating Cloudflare Tunnel %q", tunnelName)
 	tunnel, err := cf.EnsureTunnel(ctx, zone.Account.ID, tunnelName)
 	if err != nil {
-		return err
+		return diagnoseAccountPerm(ctx, cf, zone.Account.ID, zone.Account.Name, err, "Cloudflare Tunnel → Edit")
 	}
 	okf("tunnel %s", tunnel.ID)
 
@@ -150,7 +164,14 @@ func Run(ctx context.Context, o Options) error {
 	if !enabled {
 		if err := cf.EnableEmailRouting(ctx, zone.ID); err != nil {
 			warnf("couldn't enable Email Routing via API: %v", err)
-			warnf("enable it once in the dashboard (zone %s → Email → Email Routing), then mail will flow", zone.Name)
+			if isAuthzError(err) {
+				warnf("add %s to the token (it gates Email Routing settings), recreate it, and re-run setup —", bold("Zone → Zone Settings → Edit"))
+				warnf("or enable it once in the dashboard (zone %s → Email → Email Routing).", zone.Name)
+			} else {
+				warnf("enable it once in the dashboard (zone %s → Email → Email Routing), then mail will flow", zone.Name)
+			}
+		} else {
+			okf("Email Routing enabled")
 		}
 	}
 	// Write the required MX + SPF records ourselves rather than fetching them
@@ -166,7 +187,7 @@ func Run(ctx context.Context, o Options) error {
 
 	step("Setting catch-all: *@%s → %s", o.Domain, worker)
 	if err := cf.SetCatchAllToWorker(ctx, zone.ID, worker); err != nil {
-		return err
+		return permHint(err, "Zone → Email Routing Rules → Edit")
 	}
 	okf("catch-all active")
 
@@ -204,9 +225,14 @@ func Run(ctx context.Context, o Options) error {
 // (otherwise the public tunnel would let anyone inject mail).
 func ensureServerToken(ctx context.Context, o Options, authRequired bool) (token string, restartNeeded bool, err error) {
 	if authRequired {
-		// Server already locked down; we need its existing admin token.
-		token = firstNonEmpty(os.Getenv("ZORAIL_TOKEN"), readEnvValue(o.EnvFile, "ZORAIL_API_TOKEN"))
+		// Server already locked down; we need its existing admin token. Check
+		// every place it might live: the client var ($ZORAIL_TOKEN), the server
+		// var ($ZORAIL_API_TOKEN, in case it's exported rather than in .env), and
+		// the .env file setup itself writes.
+		token = firstNonEmpty(os.Getenv("ZORAIL_TOKEN"),
+			firstNonEmpty(os.Getenv("ZORAIL_API_TOKEN"), readEnvValue(o.EnvFile, "ZORAIL_API_TOKEN")))
 		if token == "" {
+			fmt.Printf("    %s find it with: %s\n", faint("tip:"), cmd("grep ZORAIL_API_TOKEN "+o.EnvFile))
 			token = promptSecret("Server requires auth — paste its ZORAIL_API_TOKEN")
 		}
 		if token == "" {
@@ -255,6 +281,38 @@ func printTunnelInstructions(envFile string) {
 	}
 }
 
+// resolveServer finds the running Zorail server, tolerating the port mismatch
+// between `zorail serve` (defaults to :8080) and the tooling default (:8090).
+// It probes, in order: the requested URL, the port from ZORAIL_HTTP_ADDR (env
+// or .env), then the two common defaults — and adopts the first that answers
+// /api/config. This means the operator doesn't have to know or match the port.
+func resolveServer(ctx context.Context, preferred, envFile string) (string, *zorailConfig, error) {
+	candidates := []string{preferred}
+	if a := firstNonEmpty(os.Getenv("ZORAIL_HTTP_ADDR"), readEnvValue(envFile, "ZORAIL_HTTP_ADDR")); a != "" {
+		candidates = append(candidates, "http://"+localProbeHost(a))
+	}
+	candidates = append(candidates, "http://127.0.0.1:8090", "http://127.0.0.1:8080")
+
+	seen := map[string]bool{}
+	var tried []string
+	for _, u := range candidates {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		tried = append(tried, u)
+		if cfg, err := newZorail(u, "").config(ctx); err == nil {
+			if u != strings.TrimRight(preferred, "/") {
+				okf("found server at %s", u)
+			}
+			return u, cfg, nil
+		}
+	}
+	return "", nil, fmt.Errorf("no Zorail server reachable (tried %s).\n    Start it first in another terminal — %s — then re-run setup.",
+		strings.Join(tried, ", "), cmd("zorail serve"))
+}
+
 // localOrigin derives the http://localhost:PORT the tunnel points at from the
 // server URL (the tunnel runs on the same host, so localhost is correct).
 func localOrigin(serverURL string) string {
@@ -271,6 +329,110 @@ func localOrigin(serverURL string) string {
 		}
 	}
 	return "http://localhost:" + port
+}
+
+const cfTokenPage = "https://dash.cloudflare.com/profile/api-tokens"
+
+// preflightPerms verifies the token can perform every operation setup needs,
+// BEFORE any provisioning writes happen, and reports ALL gaps at once. This
+// turns the old fail-one-error-at-a-time loop (fix token, rerun, hit the next
+// missing permission, rerun again) into a single fix-and-go pass.
+//
+// It probes what Cloudflare lets us probe: account scope, Cloudflare Tunnel,
+// Workers Scripts, and DNS. Email Routing Rules cannot be read-probed (the
+// Email Routing GET endpoints reject scoped tokens regardless of permissions —
+// a documented Cloudflare quirk), so it is always listed as a required manual
+// add and enforced with a clear error at the catch-all step.
+func preflightPerms(ctx context.Context, cf *CF, accountID, accountName, zoneID string) error {
+	step("Checking token permissions")
+
+	// If the whole account is out of the token's Account Resources scope, every
+	// account-level probe fails for that one reason — report it once and stop.
+	if inScope, err := cf.CanAccessAccount(ctx, accountID); err == nil && !inScope {
+		return fmt.Errorf("your token cannot act on account %s — its %s scope excludes it.\n    Recreate the token with %s at %s, then re-run setup.",
+			bold(firstNonEmpty(accountName, accountID)), bold("Account Resources"), bold("Account Resources → Include → All accounts"), cmd(cfTokenPage))
+	}
+
+	checks := []struct {
+		label, path, hint string
+	}{
+		{"Zone · DNS Edit", "/zones/" + zoneID + "/dns_records?per_page=1", "Zone → DNS → Edit"},
+		{"Account · Cloudflare Tunnel Edit", "/accounts/" + accountID + "/cfd_tunnel?per_page=1", "Account → Cloudflare Tunnel → Edit"},
+		{"Account · Workers Scripts Edit", "/accounts/" + accountID + "/workers/scripts?per_page=1", "Account → Workers Scripts → Edit"},
+		// The Email Routing settings endpoint is gated by Zone Settings (not by
+		// the Email Routing Rules permission) — this probe catches the missing
+		// permission that makes "enable Email Routing" fail with error 10000.
+		{"Zone · Zone Settings (Email Routing)", "/zones/" + zoneID + "/email/routing", "Zone → Zone Settings → Edit"},
+	}
+	var missing []string
+	for _, c := range checks {
+		switch err := cf.Probe(ctx, c.path); {
+		case err == nil:
+			okf("%s", c.label)
+		case isAuthzError(err):
+			warnf("%s — missing", c.label)
+			missing = append(missing, c.hint)
+		default:
+			// Network/transport hiccup, not a permission problem — don't block.
+			warnf("%s — could not verify (%v)", c.label, err)
+		}
+	}
+	if len(missing) > 0 {
+		// Always append the un-probeable Email Routing Rules so the user adds
+		// everything in one recreate.
+		missing = append(missing, "Zone → Email Routing Rules → Edit "+faint("(cannot be auto-checked)"))
+		return fmt.Errorf("the API token is missing required permissions:\n      • %s\n    Add them at %s (\"+ Add more\"), recreate the token, and re-run setup.",
+			strings.Join(missing, "\n      • "), cmd(cfTokenPage))
+	}
+	okf("token permissions OK (add %s too if setup stops at the catch-all step)", bold("Zone → Email Routing Rules → Edit"))
+	return nil
+}
+
+// permHint enriches a Cloudflare authorization failure with the exact token
+// permission the step needs. Tunnel and Email Routing permissions cannot be
+// pre-filled by the token-creation link, so a user who skipped the manual
+// "+ Add more" step lands here — this tells them precisely what to add.
+// Non-authorization errors pass through unchanged.
+func permHint(err error, perm string) error {
+	if err == nil || !isAuthzError(err) {
+		return err
+	}
+	return fmt.Errorf("%w\n\n    This token is missing %s.\n    Add it at %s (\"+ Add more\"), recreate the token, and re-run setup.",
+		err, bold(perm), cmd(cfTokenPage))
+}
+
+// diagnoseAccountPerm turns an authorization failure on an account-level call
+// into a precise, actionable message by probing which accounts the token can
+// reach. "Authentication error 10000" here means one of two distinct things,
+// and we tell the user exactly which:
+//   - the account is outside the token's Account Resources scope, or
+//   - the account is in scope but the specific permission was never granted.
+func diagnoseAccountPerm(ctx context.Context, cf *CF, accountID, accountName string, err error, perm string) error {
+	if err == nil || !isAuthzError(err) {
+		return err
+	}
+	name := firstNonEmpty(accountName, accountID)
+	if inScope, cerr := cf.CanAccessAccount(ctx, accountID); cerr == nil && !inScope {
+		return fmt.Errorf("%w\n\n    Your token cannot act on account %s.\n    Its \"Account Resources\" scope excludes it — recreate the token with\n    Account Resources = %s (or select that account) at %s, then re-run setup.",
+			err, bold(name), bold("All accounts"), cmd(cfTokenPage))
+	}
+	return fmt.Errorf("%w\n\n    This token is missing %s for account %s.\n    Add it (\"+ Add more\"), recreate the token at %s, and re-run setup.",
+		err, bold("Account → "+perm), bold(name), cmd(cfTokenPage))
+}
+
+// isAuthzError reports whether a Cloudflare error is an authentication/permission
+// failure (as opposed to a not-found, rate-limit, or transport error).
+func isAuthzError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{"error 10000", "error 10001", "error 9109", "Authentication error", "Unauthorized", "not authorized", "authentication"} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveCFToken finds the Cloudflare token from (in order) the --cf-token
@@ -297,24 +459,36 @@ func resolveCFToken(in *bufio.Reader, o Options) string {
 func guidedToken() string {
 	tokenURL := cfTokenTemplateURL()
 	fmt.Println("\n  A Cloudflare API token is needed once (it'll be saved for next time).")
-	fmt.Println("  Opening a " + bold("pre-filled") + " token page — just review and click " + bold("Create Token") + ", then copy it.")
+	fmt.Println("  Opening the token-creation page. Cloudflare can only pre-fill some")
+	fmt.Println("  permissions via a link, so you'll add the rest with " + bold(`"+ Add more"`) + ".")
 	fmt.Println("  " + cmd(tokenURL))
-	fmt.Println("\n  Confirm these permissions are selected (the link pre-fills them):")
-	fmt.Println("    • Account → Cloudflare Tunnel : Edit")
-	fmt.Println("    • Account → Workers Scripts : Edit")
-	fmt.Println("    • Account → Email Routing Addresses : Read")
-	fmt.Println("    • Zone    → DNS : Edit")
-	fmt.Println("    • Zone    → Email Routing Rules : Edit")
-	fmt.Println("    • Zone    → Zone : Read")
-	fmt.Println("  Zone Resources: All zones (or your specific zone).")
+	fmt.Println("\n  " + bold("Already selected by the link:"))
+	fmt.Println("    • Account → Workers Scripts          : Edit")
+	fmt.Println("    • Zone    → DNS                      : Edit")
+	fmt.Println("    • Zone    → Zone                     : Read")
+	fmt.Println("\n  " + bold(`Add these yourself ("+ Add more") — required:`))
+	fmt.Println("    • Account → " + bold("Cloudflare Tunnel") + "        : Edit")
+	fmt.Println("    • Zone    → " + bold("Email Routing Rules") + "      : Edit")
+	fmt.Println("    • Zone    → " + bold("Zone Settings") + "            : Edit   " + faint("(to enable Email Routing)"))
+	fmt.Println("    • Account → Email Routing Addresses  : Read   " + faint("(only for forwarding)"))
+	fmt.Println("\n  Account Resources: your account · Zone Resources: All zones.")
+	fmt.Println("  Then click " + bold("Create Token") + ", copy it, and paste below.")
 	openBrowser(tokenURL)
 	return promptSecret("Paste the API token")
 }
 
 // cfTokenTemplateURL builds a Cloudflare dashboard link that opens the
 // create-token page with exactly the permissions Zorail needs pre-selected and
-// the token name filled in. See:
-// https://developers.cloudflare.com/fundamentals/api/how-to/account-owned-token-template/
+// the token name filled in.
+//
+// It targets the USER-owned token page (/profile/api-tokens), NOT an
+// account-owned token. This is deliberate: Cloudflare's Tunnel (cfd_tunnel) API
+// rejects account-owned tokens with "Authentication error (10000)", so an
+// account token would pass the early checks and then fail mid-setup at tunnel
+// creation. A user-owned token with the same permissions works across every
+// endpoint setup touches (verify, zones, tunnel, workers, email routing, DNS).
+// The permissionGroupKeys template mechanism is identical for both token types.
+// See https://developers.cloudflare.com/fundamentals/api/how-to/create-via-multiple-accounts/
 func cfTokenTemplateURL() string {
 	const perms = `[` +
 		`{"key":"argo_tunnel","type":"edit"},` + // Account · Cloudflare Tunnel
@@ -322,15 +496,15 @@ func cfTokenTemplateURL() string {
 		`{"key":"email_routing_addresses","type":"read"},` + // Account · Email Routing Addresses
 		`{"key":"dns","type":"edit"},` + // Zone · DNS
 		`{"key":"email_routing_rules","type":"edit"},` + // Zone · Email Routing Rules
+		`{"key":"zone_settings","type":"edit"},` + // Zone · Zone Settings (gates Email Routing enable/status)
 		`{"key":"zone","type":"read"}` + // Zone · Zone
 		`]`
 	q := url.Values{}
-	q.Set("to", "/:account/api-tokens")
 	q.Set("permissionGroupKeys", perms)
 	q.Set("accountId", "*")
 	q.Set("zoneId", "all")
 	q.Set("name", "Zorail mail setup")
-	return "https://dash.cloudflare.com/?" + q.Encode()
+	return "https://dash.cloudflare.com/profile/api-tokens?" + q.Encode()
 }
 
 // pickDomain lists the account's zones and lets the user choose by number, or
@@ -419,6 +593,7 @@ func okf(format string, a ...any)   { fmt.Printf("    "+green("✓")+" "+format+
 func warnf(format string, a ...any) { fmt.Printf("    "+yellow("!")+" "+format+"\n", a...) }
 
 func bold(s string) string   { return "\x1b[1m" + s + "\x1b[0m" }
+func faint(s string) string  { return "\x1b[2m" + s + "\x1b[0m" }
 func green(s string) string  { return "\x1b[32m" + s + "\x1b[0m" }
 func yellow(s string) string { return "\x1b[33m" + s + "\x1b[0m" }
 func cmd(s string) string    { return "\x1b[36m" + s + "\x1b[0m" }

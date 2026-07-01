@@ -59,8 +59,18 @@ func (wk *Worker) drain(ctx context.Context) {
 		return
 	}
 	for _, j := range jobs {
+		// Raw is not stored on the job; resolve it from the message's
+		// content-addressed blob at send time (stored once, not per destination).
+		raw := j.Raw
+		if len(raw) == 0 && j.MessageID != "" {
+			if b, err := wk.store.GetRaw(ctx, j.MessageID); err == nil {
+				raw = b
+			} else {
+				wk.log.Error("forward: load raw", "err", err, "job", j.ID, "msg", j.MessageID)
+			}
+		}
 		sendCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		err := wk.sender.Send(sendCtx, wk.cfg.BounceFrom(), []string{j.Dest}, j.Raw)
+		err := wk.sender.Send(sendCtx, wk.cfg.BounceFrom(), []string{j.Dest}, raw)
 		cancel()
 		if err == nil {
 			if err := wk.store.MarkForwardSent(ctx, j.ID); err != nil {

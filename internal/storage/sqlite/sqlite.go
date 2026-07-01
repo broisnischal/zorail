@@ -5,10 +5,13 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
@@ -19,26 +22,42 @@ import (
 )
 
 // Store is a SQLite-backed storage.Store.
+//
+// It keeps two connection pools against the same WAL database: a single-writer
+// pool (w) that serializes writes, and a multi-connection reader pool (r) that
+// serves SELECTs concurrently. Under WAL, readers never block the writer and
+// vice-versa, so a slow ingest write no longer stalls every API read. Every
+// write method uses w; every read-only method uses r.
 type Store struct {
-	db *sql.DB
+	w *sql.DB // single writer (serializes writes; avoids "database is locked")
+	r *sql.DB // reader pool (concurrent SELECTs under WAL)
 }
 
 // Open opens (creating if needed) the database at path and applies the schema.
 func Open(path string) (*Store, error) {
-	// Pragmas: WAL for concurrent reads during ingest writes; busy_timeout so
-	// concurrent writers wait rather than failing; foreign_keys for cascade.
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", path)
-	db, err := sql.Open("sqlite", dsn)
+	// Writer: one connection, immediate transactions so BEGIN takes the write
+	// lock up front rather than upgrading mid-transaction (avoids deadlocks
+	// against readers). WAL + busy_timeout + foreign_keys as before.
+	wdsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_txlock=immediate", path)
+	w, err := sql.Open("sqlite", wdsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, fmt.Errorf("open sqlite (writer): %w", err)
 	}
-	// A single write connection avoids "database is locked" under WAL while
-	// still allowing the driver's internal read handling.
-	db.SetMaxOpenConns(1)
+	w.SetMaxOpenConns(1)
 
-	s := &Store{db: db}
+	// Reader: many connections. WAL lets these run concurrently with the writer.
+	rdsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=query_only(true)", path)
+	r, err := sql.Open("sqlite", rdsn)
+	if err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("open sqlite (reader): %w", err)
+	}
+	r.SetMaxOpenConns(max(4, runtime.NumCPU()))
+
+	s := &Store{w: w, r: r}
 	if err := s.migrate(context.Background()); err != nil {
-		_ = db.Close()
+		_ = w.Close()
+		_ = r.Close()
 		return nil, err
 	}
 	return s, nil
@@ -60,10 +79,23 @@ CREATE TABLE IF NOT EXISTS messages (
 	html_body   TEXT,
 	headers     TEXT,        -- JSON object
 	size        INTEGER NOT NULL DEFAULT 0,
-	raw         BLOB
+	raw         BLOB,        -- legacy inline source (old rows); new rows use raw_hash → raw_blobs
+	raw_hash    TEXT         -- sha-256 of raw; references raw_blobs(hash). NULL for legacy rows.
 );
-CREATE INDEX IF NOT EXISTS idx_messages_inbox    ON messages(inbox);
+-- Covering index for the newest-per-inbox lookup that the wait/list path hits.
+CREATE INDEX IF NOT EXISTS idx_messages_inbox    ON messages(inbox, received_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at);
+-- NB: the raw_hash column + its index are added after this batch (see migrate),
+-- because CREATE TABLE IF NOT EXISTS won't add the column to a pre-existing
+-- table, so indexing raw_hash inline would fail when upgrading an old database.
+
+-- Content-addressed raw source. A message fanned out to N recipients, and any
+-- forward job for it, all reference the same blob by hash — stored once.
+CREATE TABLE IF NOT EXISTS raw_blobs (
+	hash    TEXT PRIMARY KEY,
+	content BLOB NOT NULL,
+	size    INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS attachments (
 	id           TEXT PRIMARY KEY,
@@ -131,33 +163,111 @@ CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Full-text index over the searchable columns. Kept in sync explicitly by
+-- SaveMessage / delete paths (a standalone contentless-style table keyed by the
+-- message id we store in an UNINDEXED column). Replaces the old LIKE '%q%' scan.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+	id UNINDEXED, subject, hdr_from, inbox, text_body,
+	tokenize = 'unicode61'
+);
 `
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	if _, err := s.w.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+
+	// Add the content-addressed raw_hash column to databases created before it
+	// existed. CREATE TABLE IF NOT EXISTS above is a no-op on an existing table,
+	// so the column must be added explicitly; then it is safe to index.
+	if err := s.ensureColumn(ctx, "messages", "raw_hash", "raw_hash TEXT"); err != nil {
+		return fmt.Errorf("migrate: add messages.raw_hash: %w", err)
+	}
+	if _, err := s.w.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_messages_raw_hash ON messages(raw_hash)`); err != nil {
+		return fmt.Errorf("migrate: index raw_hash: %w", err)
+	}
+
+	// One-time backfill: if the FTS index is empty but messages exist (e.g. an
+	// upgrade of an existing database), index what's already there.
+	var ftsCount, msgCount int
+	_ = s.w.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages_fts`).Scan(&ftsCount)
+	_ = s.w.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&msgCount)
+	if ftsCount == 0 && msgCount > 0 {
+		if _, err := s.w.ExecContext(ctx, `
+INSERT INTO messages_fts (id, subject, hdr_from, inbox, text_body)
+SELECT id, subject, hdr_from, inbox, text_body FROM messages`); err != nil {
+			return fmt.Errorf("migrate: backfill fts: %w", err)
+		}
 	}
 	return nil
 }
 
-// SaveMessage persists a message and its attachments in one transaction.
+// ensureColumn adds a column to a table if it is not already present, so old
+// databases pick up columns introduced in newer schema versions. It is a no-op
+// when the column already exists (idempotent across restarts).
+func (s *Store) ensureColumn(ctx context.Context, table, column, ddl string) error {
+	rows, err := s.w.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil // already present
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.w.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+ddl)
+	return err
+}
+
+// SaveMessage persists a message and its attachments in one transaction. The
+// raw source is stored once, content-addressed by sha-256 in raw_blobs, so a
+// fan-out to several recipients (and any forward job) share a single blob.
 func (s *Store) SaveMessage(ctx context.Context, m *model.Message) error {
 	toJSON, _ := json.Marshal(m.To)
 	hdrJSON, _ := json.Marshal(m.Headers)
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	var rawHash any
+	if len(m.Raw) > 0 {
+		sum := sha256.Sum256(m.Raw)
+		rawHash = hex.EncodeToString(sum[:])
+	}
+
+	tx, err := s.w.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if rawHash != nil {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO raw_blobs (hash, content, size) VALUES (?,?,?) ON CONFLICT(hash) DO NOTHING`,
+			rawHash, m.Raw, len(m.Raw)); err != nil {
+			return fmt.Errorf("insert raw blob: %w", err)
+		}
+	}
+
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO messages
-	(id, inbox, env_from, hdr_from, hdr_to, subject, message_id, date, received_at, text_body, html_body, headers, size, raw)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	(id, inbox, env_from, hdr_from, hdr_to, subject, message_id, date, received_at, text_body, html_body, headers, size, raw, raw_hash)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)`,
 		m.ID, m.Inbox, m.EnvFrom, m.From, string(toJSON), m.Subject, m.MessageID,
-		nullableUnix(m.Date), m.ReceivedAt.Unix(), m.Text, m.HTML, string(hdrJSON), m.Size, m.Raw,
+		nullableUnix(m.Date), m.ReceivedAt.Unix(), m.Text, m.HTML, string(hdrJSON), m.Size, rawHash,
 	)
 	if err != nil {
 		return fmt.Errorf("insert message: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO messages_fts (id, subject, hdr_from, inbox, text_body) VALUES (?,?,?,?,?)`,
+		m.ID, m.Subject, m.From, m.Inbox, m.Text); err != nil {
+		return fmt.Errorf("index message: %w", err)
 	}
 
 	for i := range m.Attachments {
@@ -179,7 +289,7 @@ VALUES (?,?,?,?,?,?)`,
 
 // ListInboxes returns one summary row per inbox that has received mail.
 func (s *Store) ListInboxes(ctx context.Context) ([]model.InboxSummary, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.r.QueryContext(ctx, `
 SELECT inbox, COUNT(*), MAX(received_at)
 FROM messages
 GROUP BY inbox
@@ -211,7 +321,7 @@ func (s *Store) ListMessages(ctx context.Context, inbox string, limit, offset in
 	if offset < 0 {
 		offset = 0
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.r.QueryContext(ctx, `
 SELECT id, inbox, env_from, hdr_from, hdr_to, subject, message_id, date, received_at, size
 FROM messages
 WHERE inbox = ?
@@ -246,13 +356,21 @@ func scanMetaRows(rows *sql.Rows) ([]*model.Message, error) {
 	return out, rows.Err()
 }
 
-// escapeLike escapes LIKE wildcards so user input is matched literally.
-func escapeLike(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+// ftsQuery turns free-form user input into a safe FTS5 MATCH expression: each
+// alphanumeric token becomes a prefix term (token*) AND-ed together, so "acme
+// cod" matches "Acme verification code". Returns "" when nothing is searchable.
+func ftsQuery(q string) string {
+	var terms []string
+	for _, tok := range strings.FieldsFunc(q, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
+	}) {
+		terms = append(terms, `"`+tok+`"*`)
+	}
+	return strings.Join(terms, " ")
 }
 
-// SearchMessages does a substring search across subject, sender, and text body
-// over every inbox, newest first.
+// SearchMessages does a full-text search across subject, sender, inbox, and
+// text body over every inbox, newest first, backed by the FTS5 index.
 func (s *Store) SearchMessages(ctx context.Context, q string, limit int) ([]*model.Message, error) {
 	q = strings.TrimSpace(q)
 	if q == "" {
@@ -261,16 +379,16 @@ func (s *Store) SearchMessages(ctx context.Context, q string, limit int) ([]*mod
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
-	like := "%" + escapeLike(q) + "%"
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, inbox, env_from, hdr_from, hdr_to, subject, message_id, date, received_at, size
-FROM messages
-WHERE subject LIKE ?1 ESCAPE '\'
-   OR hdr_from LIKE ?1 ESCAPE '\'
-   OR inbox LIKE ?1 ESCAPE '\'
-   OR text_body LIKE ?1 ESCAPE '\'
-ORDER BY received_at DESC, id DESC
-LIMIT ?2`, like, limit)
+	match := ftsQuery(q)
+	if match == "" {
+		return []*model.Message{}, nil
+	}
+	rows, err := s.r.QueryContext(ctx, `
+SELECT m.id, m.inbox, m.env_from, m.hdr_from, m.hdr_to, m.subject, m.message_id, m.date, m.received_at, m.size
+FROM messages m
+WHERE m.id IN (SELECT id FROM messages_fts WHERE messages_fts MATCH ?1)
+ORDER BY m.received_at DESC, m.id DESC
+LIMIT ?2`, match, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -278,18 +396,40 @@ LIMIT ?2`, like, limit)
 	return scanMetaRows(rows)
 }
 
-// GetMessage returns a fully-populated message including bodies, headers, raw,
-// and attachment metadata (attachment content is loaded too for MVP).
+// LatestMessageID returns the id of the newest message in inbox, or "" if the
+// inbox is empty or its newest id does not sort strictly after `after`. It reads
+// only the id (no bodies/blobs), so long-poll waiters can cheaply check for a
+// new arrival before doing a full GetMessage. Relies on time-ordered ULID ids.
+func (s *Store) LatestMessageID(ctx context.Context, inbox, after string) (string, error) {
+	var id string
+	err := s.r.QueryRowContext(ctx, `
+SELECT id FROM messages WHERE inbox = ? ORDER BY received_at DESC, id DESC LIMIT 1`, inbox).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if after != "" && id <= after {
+		return "", nil
+	}
+	return id, nil
+}
+
+// GetMessage returns a message's bodies, headers, and attachment *metadata*.
+// It deliberately does NOT load the raw source or attachment content — those are
+// large BLOBs fetched lazily via GetRaw / GetAttachment only when a client
+// actually downloads them. This keeps the hot read/wait path cheap.
 func (s *Store) GetMessage(ctx context.Context, msgID string) (*model.Message, error) {
 	m := &model.Message{}
 	var toJSON, hdrJSON string
 	var date sql.NullInt64
 	var recv int64
-	err := s.db.QueryRowContext(ctx, `
-SELECT id, inbox, env_from, hdr_from, hdr_to, subject, message_id, date, received_at, text_body, html_body, headers, size, raw
+	err := s.r.QueryRowContext(ctx, `
+SELECT id, inbox, env_from, hdr_from, hdr_to, subject, message_id, date, received_at, text_body, html_body, headers, size
 FROM messages WHERE id = ?`, msgID).Scan(
 		&m.ID, &m.Inbox, &m.EnvFrom, &m.From, &toJSON, &m.Subject, &m.MessageID,
-		&date, &recv, &m.Text, &m.HTML, &hdrJSON, &m.Size, &m.Raw,
+		&date, &recv, &m.Text, &m.HTML, &hdrJSON, &m.Size,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, storage.ErrNotFound
@@ -304,15 +444,15 @@ FROM messages WHERE id = ?`, msgID).Scan(
 	}
 	m.ReceivedAt = time.Unix(recv, 0).UTC()
 
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, filename, content_type, size, content FROM attachments WHERE message_id = ?`, msgID)
+	rows, err := s.r.QueryContext(ctx, `
+SELECT id, filename, content_type, size FROM attachments WHERE message_id = ?`, msgID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var a model.Attachment
-		if err := rows.Scan(&a.ID, &a.Filename, &a.ContentType, &a.Size, &a.Content); err != nil {
+		if err := rows.Scan(&a.ID, &a.Filename, &a.ContentType, &a.Size); err != nil {
 			return nil, err
 		}
 		m.Attachments = append(m.Attachments, a)
@@ -320,30 +460,87 @@ SELECT id, filename, content_type, size, content FROM attachments WHERE message_
 	return m, rows.Err()
 }
 
-// DeleteMessage removes a message; attachments cascade via foreign key.
+// GetRaw returns the verbatim RFC 5322 source for a message, resolving the
+// content-addressed blob (new rows) or the legacy inline column (old rows).
+func (s *Store) GetRaw(ctx context.Context, msgID string) ([]byte, error) {
+	var raw []byte
+	var hash sql.NullString
+	err := s.r.QueryRowContext(ctx, `SELECT raw, raw_hash FROM messages WHERE id = ?`, msgID).Scan(&raw, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if hash.Valid && hash.String != "" {
+		var content []byte
+		err := s.r.QueryRowContext(ctx, `SELECT content FROM raw_blobs WHERE hash = ?`, hash.String).Scan(&content)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, storage.ErrNotFound
+		}
+		return content, err
+	}
+	return raw, nil
+}
+
+// GetAttachment loads a single attachment's content by message and attachment id.
+func (s *Store) GetAttachment(ctx context.Context, msgID, attID string) (*model.Attachment, error) {
+	a := &model.Attachment{}
+	err := s.r.QueryRowContext(ctx, `
+SELECT id, filename, content_type, size, content FROM attachments WHERE message_id = ? AND id = ?`,
+		msgID, attID).Scan(&a.ID, &a.Filename, &a.ContentType, &a.Size, &a.Content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// DeleteMessage removes a message; attachments cascade via foreign key. The FTS
+// row and any now-orphaned raw blob are cleaned up too.
 func (s *Store) DeleteMessage(ctx context.Context, msgID string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, msgID)
+	res, err := s.w.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, msgID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return storage.ErrNotFound
 	}
+	_, _ = s.w.ExecContext(ctx, `DELETE FROM messages_fts WHERE id = ?`, msgID)
+	s.gcRawBlobs(ctx)
 	return nil
 }
 
 // DeleteInbox removes all messages for an inbox; attachments cascade.
 func (s *Store) DeleteInbox(ctx context.Context, inbox string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE inbox = ?`, inbox)
+	res, err := s.w.ExecContext(ctx, `DELETE FROM messages WHERE inbox = ?`, inbox)
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	_, _ = s.w.ExecContext(ctx, `DELETE FROM messages_fts WHERE inbox = ?`, inbox)
+	s.gcRawBlobs(ctx)
 	return n, nil
 }
 
-// Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+// gcRawBlobs deletes content-addressed blobs no longer referenced by any
+// message. Best-effort: failure only leaves reclaimable space behind.
+func (s *Store) gcRawBlobs(ctx context.Context) {
+	_, _ = s.w.ExecContext(ctx, `
+DELETE FROM raw_blobs
+WHERE hash NOT IN (SELECT raw_hash FROM messages WHERE raw_hash IS NOT NULL)`)
+}
+
+// Close closes both connection pools.
+func (s *Store) Close() error {
+	err := s.r.Close()
+	if werr := s.w.Close(); werr != nil {
+		return werr
+	}
+	return err
+}
 
 func nullableUnix(t time.Time) any {
 	if t.IsZero() {

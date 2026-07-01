@@ -101,8 +101,11 @@ func Doctor(ctx context.Context, o Options) error {
 		return "  active", nil
 	})
 
-	z := newZorail(o.ServerURL, "")
-	cfg, cfgErr := z.config(ctx)
+	// Tolerate the :8090/:8080 default split by probing for the live server.
+	resolvedURL, cfg, cfgErr := resolveServer(ctx, o.ServerURL, o.EnvFile)
+	if cfgErr == nil {
+		o.ServerURL = resolvedURL
+	}
 	chk("Local server reachable", func() (string, error) {
 		if cfgErr != nil {
 			return "", cfgErr
