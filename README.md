@@ -268,16 +268,24 @@ sender → Cloudflare (MX) → Email Worker → HTTPS POST /api/ingest
 ```
 
 Run it on the machine hosting the server (the domain must already be on
-Cloudflare). It opens a **pre-filled Cloudflare token page** (just click Create),
-lets you **pick the domain** from your zones, then creates a Tunnel pointing a
-hostname at `localhost`, deploys the ingest Worker, enables Email Routing with
-the MX/SPF records, and sets the catch-all `*@domain → Worker`. Everything it
-needs — `ZORAIL_API_TOKEN`, domain, tunnel token — is written to a single `.env`.
+Cloudflare). It opens a Cloudflare token page with some permissions pre-filled
+(you add a few more with **“+ Add more”** — see the exact list in
+[docs/SETUP.md](docs/SETUP.md)), lets you **pick the domain** from your zones,
+**preflights every permission** so you fix the token in one pass, then creates a
+Tunnel pointing a hostname at `localhost`, deploys the ingest Worker, enables
+Email Routing with the MX/SPF records, and sets the catch-all `*@domain →
+Worker`. Everything it needs — `ZORAIL_API_TOKEN`, domain, tunnel token — is
+written to a single `.env`.
 
 ```bash
-zorail setup        # pick domain, click Create on the pre-filled token page
-zorail up           # starts the server AND the Cloudflare Tunnel together
-zorail doctor       # verify the whole pipeline end-to-end (in another terminal)
+zorail                # start the server first (setup auto-detects its port)
+zorail setup          # pick domain, paste token; preflight checks all permissions
+zorail up             # starts the server AND the Cloudflare Tunnel together
+zorail doctor         # verify the whole pipeline end-to-end (another terminal)
+zorail watch          # live inbox viewer (auto-reads URL + token from .env)
+
+zorail service        # print a systemd unit to run it as a boot-time daemon
+zorail reset          # wipe local db + config to start over
 ```
 
 `zorail up` loads `.env`, starts the server and `cloudflared` together (and
